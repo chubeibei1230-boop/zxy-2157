@@ -6,7 +6,8 @@ from pydantic import BaseModel
 
 from models import (
     ServiceProject, PointRule, DeductionRule,
-    ServiceRecord, MonthlySettlement, QualityLevel, RecordStatus
+    ServiceRecord, MonthlySettlement, QualityLevel, RecordStatus,
+    ServiceRecordAppeal, AppealCorrection
 )
 import services
 
@@ -92,6 +93,26 @@ class RecordSubmitRequest(BaseModel):
 class SettlementRequest(BaseModel):
     month: str
     operator: str
+
+
+class AppealSubmitRequest(BaseModel):
+    record_id: str
+    appeal_reason: str
+    submitted_by: str
+    supplementary_note: Optional[str] = None
+    expected_result: Optional[str] = None
+
+
+class AppealApproveRequest(BaseModel):
+    handler: str
+    correction: AppealCorrection
+    handle_note: Optional[str] = None
+
+
+class AppealRejectRequest(BaseModel):
+    handler: str
+    rejection_reason: str
+    handle_note: Optional[str] = None
 
 
 # ==================== Project APIs ====================
@@ -386,6 +407,68 @@ def export_settlements_csv(month: Optional[str] = None):
             "Content-Disposition": f"attachment; filename=monthly_settlements_{datetime.now().strftime('%Y%m%d')}.csv"
         }
     )
+
+
+# ==================== Appeal APIs ====================
+
+@app.post("/api/appeals", response_model=ServiceRecordAppeal, summary="提交服务记录申诉")
+def submit_appeal(req: AppealSubmitRequest):
+    appeal, error = services.submit_appeal(
+        req.record_id, req.appeal_reason, req.submitted_by,
+        req.supplementary_note, req.expected_result
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return appeal
+
+
+@app.get("/api/appeals", response_model=List[ServiceRecordAppeal], summary="查询申诉列表")
+def query_appeals(
+    status: Optional[str] = None,
+    month: Optional[str] = None,
+    participant_id: Optional[str] = None,
+    participant_name: Optional[str] = None,
+    project_id: Optional[str] = None
+):
+    return services.query_appeals(
+        status=status, month=month,
+        participant_id=participant_id,
+        participant_name=participant_name,
+        project_id=project_id
+    )
+
+
+@app.get("/api/appeals/{appeal_id}", summary="获取申诉详情")
+def get_appeal_detail(appeal_id: str):
+    detail = services.get_appeal_detail(appeal_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="申诉不存在")
+    return detail
+
+
+@app.post("/api/appeals/{appeal_id}/approve", response_model=ServiceRecordAppeal, summary="通过申诉并更正积分")
+def approve_appeal(appeal_id: str, req: AppealApproveRequest):
+    appeal, error = services.approve_appeal(
+        appeal_id, req.handler, req.correction, req.handle_note
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return appeal
+
+
+@app.post("/api/appeals/{appeal_id}/reject", response_model=ServiceRecordAppeal, summary="驳回申诉")
+def reject_appeal(appeal_id: str, req: AppealRejectRequest):
+    appeal, error = services.reject_appeal(
+        appeal_id, req.handler, req.rejection_reason, req.handle_note
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return appeal
+
+
+@app.get("/api/records/{record_id}/appeals", response_model=List[ServiceRecordAppeal], summary="获取某记录的申诉列表")
+def get_record_appeals(record_id: str):
+    return services.get_appeals_by_record(record_id)
 
 
 @app.get("/", summary="系统健康检查")

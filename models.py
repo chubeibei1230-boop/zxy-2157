@@ -4,6 +4,51 @@ from pydantic import BaseModel, Field
 
 RecordStatus = Literal["待登记", "待复核", "已计入", "已退回", "作废"]
 QualityLevel = Literal["优秀", "良好", "合格", "不合格"]
+AppealStatus = Literal["待处理", "处理中", "已通过", "已驳回"]
+
+
+class AppealCorrection(BaseModel):
+    quality: Optional[QualityLevel] = None
+    duration_hours: Optional[float] = None
+    deduction_rule_id: Optional[str] = None
+    deduction_points: Optional[float] = None
+    final_points: Optional[float] = None
+    note: Optional[str] = None
+
+
+class TimelineEvent(BaseModel):
+    event_type: str
+    operator: str
+    operated_at: datetime = Field(default_factory=datetime.now)
+    description: str
+
+
+class ServiceRecordAppeal(BaseModel):
+    appeal_id: str
+    record_id: str
+    participant_id: str
+    participant_name: str
+    project_id: str
+    service_date: date
+    month: str
+    appeal_reason: str
+    supplementary_note: Optional[str] = None
+    expected_result: Optional[str] = None
+    status: AppealStatus = "待处理"
+    submitted_by: str
+    submitted_at: datetime = Field(default_factory=datetime.now)
+    handler: Optional[str] = None
+    handled_at: Optional[datetime] = None
+    handle_note: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    correction: Optional[AppealCorrection] = None
+    original_calculated_points: Optional[float] = None
+    original_deduction_points: Optional[float] = None
+    original_final_points: Optional[float] = None
+    original_quality: Optional[QualityLevel] = None
+    original_duration_hours: Optional[float] = None
+    original_status: Optional[RecordStatus] = None
+    timeline: List[TimelineEvent] = Field(default_factory=list)
 
 
 class ServiceProject(BaseModel):

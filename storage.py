@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import List, Optional, Dict, Any
 from models import (
     ServiceProject, PointRule, DeductionRule,
-    ServiceRecord, MonthlySettlement
+    ServiceRecord, MonthlySettlement, ServiceRecordAppeal, AppealCorrection, TimelineEvent
 )
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -15,6 +15,7 @@ POINT_RULES_FILE = os.path.join(DATA_DIR, "point_rules.csv")
 DEDUCTION_RULES_FILE = os.path.join(DATA_DIR, "deduction_rules.csv")
 RECORDS_FILE = os.path.join(DATA_DIR, "service_records.csv")
 SETTLEMENTS_FILE = os.path.join(DATA_DIR, "monthly_settlements.csv")
+APPEALS_FILE = os.path.join(DATA_DIR, "service_record_appeals.csv")
 
 
 def _ensure_data_dir():
@@ -39,7 +40,15 @@ def _init_csv_files():
                        "final_points", "month", "warnings"],
         SETTLEMENTS_FILE: ["settlement_id", "month", "participant_id", "participant_name",
                            "total_records", "total_hours", "base_points", "deduction_points",
-                           "final_points", "settled_at", "settled_by"]
+                           "final_points", "settled_at", "settled_by"],
+        APPEALS_FILE: ["appeal_id", "record_id", "participant_id", "participant_name",
+                       "project_id", "service_date", "month", "appeal_reason",
+                       "supplementary_note", "expected_result", "status",
+                       "submitted_by", "submitted_at", "handler", "handled_at",
+                       "handle_note", "rejection_reason", "correction",
+                       "original_calculated_points", "original_deduction_points",
+                       "original_final_points", "original_quality",
+                       "original_duration_hours", "original_status", "timeline"]
     }
     for filepath, headers in files.items():
         if not os.path.exists(filepath):
@@ -58,7 +67,7 @@ def _serialize_value(val: Any) -> str:
     if isinstance(val, bool):
         return "true" if val else "false"
     if isinstance(val, (dict, list)):
-        return json.dumps(val, ensure_ascii=False)
+        return json.dumps(val, ensure_ascii=False, default=str)
     return str(val)
 
 
@@ -341,3 +350,79 @@ def delete_settlements_by_month(month: str):
                "final_points", "settled_at", "settled_by"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
+
+
+# ==================== Service Record Appeals ====================
+
+def _row_to_appeal(r: Dict) -> ServiceRecordAppeal:
+    correction_raw = _parse_json(r.get("correction", ""))
+    correction = AppealCorrection(**correction_raw) if correction_raw else None
+    timeline_raw = _parse_json(r.get("timeline", ""))
+    timeline = []
+    if isinstance(timeline_raw, list):
+        for t in timeline_raw:
+            if isinstance(t, dict):
+                timeline.append(TimelineEvent(**t))
+    return ServiceRecordAppeal(
+        appeal_id=r["appeal_id"],
+        record_id=r["record_id"],
+        participant_id=r["participant_id"],
+        participant_name=r["participant_name"],
+        project_id=r["project_id"],
+        service_date=_parse_date(r["service_date"]),
+        month=r["month"],
+        appeal_reason=r["appeal_reason"],
+        supplementary_note=r.get("supplementary_note") or None,
+        expected_result=r.get("expected_result") or None,
+        status=r.get("status", "待处理"),
+        submitted_by=r["submitted_by"],
+        submitted_at=_parse_datetime(r["submitted_at"]),
+        handler=r.get("handler") or None,
+        handled_at=_parse_datetime(r.get("handled_at", "")),
+        handle_note=r.get("handle_note") or None,
+        rejection_reason=r.get("rejection_reason") or None,
+        correction=correction,
+        original_calculated_points=float(r["original_calculated_points"]) if r.get("original_calculated_points") else None,
+        original_deduction_points=float(r["original_deduction_points"]) if r.get("original_deduction_points") else None,
+        original_final_points=float(r["original_final_points"]) if r.get("original_final_points") else None,
+        original_quality=r.get("original_quality") or None,
+        original_duration_hours=float(r["original_duration_hours"]) if r.get("original_duration_hours") else None,
+        original_status=r.get("original_status") or None,
+        timeline=timeline
+    )
+
+
+def list_appeals() -> List[ServiceRecordAppeal]:
+    rows = _read_csv(APPEALS_FILE)
+    return [_row_to_appeal(r) for r in rows]
+
+
+def get_appeal(appeal_id: str) -> Optional[ServiceRecordAppeal]:
+    for a in list_appeals():
+        if a.appeal_id == appeal_id:
+            return a
+    return None
+
+
+def get_appeals_by_record(record_id: str) -> List[ServiceRecordAppeal]:
+    return [a for a in list_appeals() if a.record_id == record_id]
+
+
+def save_appeal(appeal: ServiceRecordAppeal):
+    appeals = list_appeals()
+    for i, a in enumerate(appeals):
+        if a.appeal_id == appeal.appeal_id:
+            appeals[i] = appeal
+            break
+    else:
+        appeals.append(appeal)
+    headers = ["appeal_id", "record_id", "participant_id", "participant_name",
+               "project_id", "service_date", "month", "appeal_reason",
+               "supplementary_note", "expected_result", "status",
+               "submitted_by", "submitted_at", "handler", "handled_at",
+               "handle_note", "rejection_reason", "correction",
+               "original_calculated_points", "original_deduction_points",
+               "original_final_points", "original_quality",
+               "original_duration_hours", "original_status", "timeline"]
+    rows = [a.dict() for a in appeals]
+    _write_csv(APPEALS_FILE, headers, rows)

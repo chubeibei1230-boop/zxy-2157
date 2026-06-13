@@ -5,7 +5,8 @@ from collections import defaultdict
 
 from models import (
     ServiceProject, PointRule, DeductionRule,
-    ServiceRecord, MonthlySettlement, QualityLevel
+    ServiceRecord, MonthlySettlement, QualityLevel,
+    ServiceRecordAppeal, AppealCorrection, TimelineEvent
 )
 import storage
 
@@ -519,3 +520,254 @@ def get_settlements(month: Optional[str] = None,
         settlements = [s for s in settlements if s.participant_id == participant_id]
     settlements.sort(key=lambda s: s.final_points, reverse=True)
     return settlements
+
+
+# ==================== Service Record Appeals ====================
+
+def submit_appeal(record_id: str, appeal_reason: str, submitted_by: str,
+                  supplementary_note: Optional[str] = None,
+                  expected_result: Optional[str] = None) -> Tuple[Optional[ServiceRecordAppeal], Optional[str]]:
+    record = storage.get_record(record_id)
+    if not record:
+        return None, "服务记录不存在"
+    if record.status not in ["已退回", "已计入"]:
+        return None, f"当前记录状态为「{record.status}」，只有「已退回」或「已计入」的记录可以申诉"
+
+    existing_appeals = storage.get_appeals_by_record(record_id)
+    pending_appeals = [a for a in existing_appeals if a.status in ["待处理", "处理中"]]
+    if pending_appeals:
+        return None, "该记录已有待处理的申诉，请勿重复提交"
+
+    appeal = ServiceRecordAppeal(
+        appeal_id=generate_id("appeal"),
+        record_id=record_id,
+        participant_id=record.participant_id,
+        participant_name=record.participant_name,
+        project_id=record.project_id,
+        service_date=record.service_date,
+        month=record.month or "",
+        appeal_reason=appeal_reason,
+        supplementary_note=supplementary_note,
+        expected_result=expected_result,
+        status="待处理",
+        submitted_by=submitted_by,
+        original_calculated_points=record.calculated_points,
+        original_deduction_points=record.deduction_points,
+        original_final_points=record.final_points,
+        original_quality=record.quality,
+        original_duration_hours=record.duration_hours,
+        original_status=record.status,
+        timeline=[
+            TimelineEvent(
+                event_type="提交申诉",
+                operator=submitted_by,
+                description=f"提交申诉，原因：{appeal_reason}"
+            )
+        ]
+    )
+    storage.save_appeal(appeal)
+    return appeal, None
+
+
+def query_appeals(status: Optional[str] = None,
+                  month: Optional[str] = None,
+                  participant_id: Optional[str] = None,
+                  participant_name: Optional[str] = None,
+                  project_id: Optional[str] = None) -> List[ServiceRecordAppeal]:
+    appeals = storage.list_appeals()
+    if status:
+        appeals = [a for a in appeals if a.status == status]
+    if month:
+        appeals = [a for a in appeals if a.month == month]
+    if participant_id:
+        appeals = [a for a in appeals if a.participant_id == participant_id]
+    if participant_name:
+        appeals = [a for a in appeals if participant_name in a.participant_name]
+    if project_id:
+        appeals = [a for a in appeals if a.project_id == project_id]
+    appeals.sort(key=lambda a: a.submitted_at, reverse=True)
+    return appeals
+
+
+def get_appeal_detail(appeal_id: str) -> Optional[Dict]:
+    appeal = storage.get_appeal(appeal_id)
+    if not appeal:
+        return None
+    record = storage.get_record(appeal.record_id)
+    return {
+        "appeal": appeal,
+        "original_record": record
+    }
+
+
+def _recalculate_record_points(record: ServiceRecord) -> ServiceRecord:
+    point_rule = None
+    if record.applicable_point_rule_id:
+        point_rule = storage.get_point_rule(record.applicable_point_rule_id)
+    if not point_rule:
+        point_rule = storage.get_applicable_point_rule(record.project_id, record.service_date)
+        if point_rule:
+            record.applicable_point_rule_id = point_rule.rule_id
+            record.applicable_point_version = point_rule.rule_version
+
+    if point_rule:
+        multiplier = point_rule.quality_multiplier.get(record.quality, 0.0)
+        record.calculated_points = record.duration_hours * point_rule.base_points_per_hour * multiplier
+    else:
+        record.calculated_points = record.calculated_points or 0.0
+
+    if record.deduction_points is None:
+        record.deduction_points = 0.0
+
+    record.final_points = record.calculated_points - record.deduction_points
+    return record
+
+
+def _update_settlement_after_correction(record: ServiceRecord,
+                                        old_calc_points: float, old_ded_points: float,
+                                        old_duration: float, old_status: str,
+                                        operator: str):
+    if not record.month:
+        return
+
+    new_calc_points = record.calculated_points or 0.0
+    new_ded_points = record.deduction_points or 0.0
+    new_duration = record.duration_hours
+    new_status = record.status
+
+    was_counted = old_status == "已计入"
+    is_counted = new_status == "已计入"
+
+    if not was_counted and not is_counted:
+        return
+
+    settlements = storage.list_settlements()
+    target_settlement = None
+    for s in settlements:
+        if s.month == record.month and s.participant_id == record.participant_id:
+            target_settlement = s
+            break
+
+    if not target_settlement:
+        return
+
+    if was_counted and is_counted:
+        calc_diff = new_calc_points - old_calc_points
+        ded_diff = new_ded_points - old_ded_points
+        duration_diff = new_duration - old_duration
+        target_settlement.base_points = round(target_settlement.base_points + calc_diff, 2)
+        target_settlement.deduction_points = round(target_settlement.deduction_points + ded_diff, 2)
+        target_settlement.total_hours = round(target_settlement.total_hours + duration_diff, 2)
+        target_settlement.final_points = round(target_settlement.base_points - target_settlement.deduction_points, 2)
+    elif was_counted and not is_counted:
+        target_settlement.total_records -= 1
+        target_settlement.base_points = round(target_settlement.base_points - old_calc_points, 2)
+        target_settlement.deduction_points = round(target_settlement.deduction_points - old_ded_points, 2)
+        target_settlement.total_hours = round(target_settlement.total_hours - old_duration, 2)
+        target_settlement.final_points = round(target_settlement.base_points - target_settlement.deduction_points, 2)
+    elif not was_counted and is_counted:
+        target_settlement.total_records += 1
+        target_settlement.base_points = round(target_settlement.base_points + new_calc_points, 2)
+        target_settlement.deduction_points = round(target_settlement.deduction_points + new_ded_points, 2)
+        target_settlement.total_hours = round(target_settlement.total_hours + new_duration, 2)
+        target_settlement.final_points = round(target_settlement.base_points - target_settlement.deduction_points, 2)
+
+    target_settlement.settled_at = datetime.now()
+    target_settlement.settled_by = operator
+    storage.save_settlement(target_settlement)
+
+
+def approve_appeal(appeal_id: str, handler: str,
+                   correction: AppealCorrection,
+                   handle_note: Optional[str] = None) -> Tuple[Optional[ServiceRecordAppeal], Optional[str]]:
+    appeal = storage.get_appeal(appeal_id)
+    if not appeal:
+        return None, "申诉不存在"
+    if appeal.status not in ["待处理", "处理中"]:
+        return None, f"当前申诉状态为「{appeal.status}」，只有待处理或处理中的申诉可以通过"
+
+    record = storage.get_record(appeal.record_id)
+    if not record:
+        return None, "关联的服务记录不存在"
+
+    old_calc_points = record.calculated_points or 0.0
+    old_ded_points = record.deduction_points or 0.0
+    old_duration = record.duration_hours
+    old_status = record.status
+
+    if correction.quality is not None:
+        record.quality = correction.quality
+    if correction.duration_hours is not None:
+        record.duration_hours = correction.duration_hours
+    if correction.deduction_rule_id is not None:
+        ded_rule = storage.get_deduction_rule(correction.deduction_rule_id)
+        if not ded_rule:
+            return None, "扣减规则不存在"
+        if ded_rule.effective_date > record.service_date:
+            return None, f"扣减规则生效日期({ded_rule.effective_date})晚于服务日期({record.service_date})，不能应用"
+        record.applicable_deduction_id = ded_rule.deduction_id
+        record.applicable_deduction_version = ded_rule.rule_version
+        record.deduction_points = ded_rule.deduction_points
+    if correction.deduction_points is not None:
+        record.deduction_points = correction.deduction_points
+
+    record = _recalculate_record_points(record)
+
+    if correction.final_points is not None:
+        record.final_points = correction.final_points
+
+    if record.status == "已退回":
+        record.status = "已计入"
+        record.rejection_reason = None
+
+    storage.save_record(record)
+
+    _update_settlement_after_correction(
+        record, old_calc_points, old_ded_points,
+        old_duration, old_status, handler
+    )
+
+    appeal.status = "已通过"
+    appeal.handler = handler
+    appeal.handled_at = datetime.now()
+    appeal.handle_note = handle_note
+    appeal.correction = correction
+    appeal.timeline.append(
+        TimelineEvent(
+            event_type="申诉通过",
+            operator=handler,
+            description=f"申诉通过，处理说明：{handle_note or '无'}"
+        )
+    )
+    storage.save_appeal(appeal)
+
+    return appeal, None
+
+
+def reject_appeal(appeal_id: str, handler: str,
+                  rejection_reason: str,
+                  handle_note: Optional[str] = None) -> Tuple[Optional[ServiceRecordAppeal], Optional[str]]:
+    appeal = storage.get_appeal(appeal_id)
+    if not appeal:
+        return None, "申诉不存在"
+    if appeal.status not in ["待处理", "处理中"]:
+        return None, f"当前申诉状态为「{appeal.status}」，只有待处理或处理中的申诉可以驳回"
+
+    appeal.status = "已驳回"
+    appeal.handler = handler
+    appeal.handled_at = datetime.now()
+    appeal.handle_note = handle_note
+    appeal.rejection_reason = rejection_reason
+    appeal.timeline.append(
+        TimelineEvent(
+            event_type="申诉驳回",
+            operator=handler,
+            description=f"申诉驳回，原因：{rejection_reason}"
+        )
+    )
+    storage.save_appeal(appeal)
+    return appeal, None
+
+
+def get_appeals_by_record(record_id: str) -> List[ServiceRecordAppeal]:
+    return storage.get_appeals_by_record(record_id)
