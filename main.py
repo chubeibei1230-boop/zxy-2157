@@ -85,6 +85,10 @@ class RecordVoidRequest(BaseModel):
     operator: str
 
 
+class RecordSubmitRequest(BaseModel):
+    operator: str
+
+
 class SettlementRequest(BaseModel):
     month: str
     operator: str
@@ -139,17 +143,19 @@ def list_point_rules(project_id: Optional[str] = None):
     return services.storage.list_point_rules()
 
 
+@app.get("/api/point-rules/applicable", response_model=Optional[PointRule], summary="获取适用的积分规则")
+def get_applicable_point_rule(project_id: str, service_date: date):
+    rule = services.storage.get_applicable_point_rule(project_id, service_date)
+    if not rule:
+        raise HTTPException(status_code=404, detail="在该服务日期无适用的积分规则")
+    return rule
+
+
 @app.get("/api/point-rules/{rule_id}", response_model=PointRule, summary="获取单个积分规则")
 def get_point_rule(rule_id: str):
     rule = services.storage.get_point_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="积分规则不存在")
-    return rule
-
-
-@app.get("/api/point-rules/applicable", response_model=Optional[PointRule], summary="获取适用的积分规则")
-def get_applicable_point_rule(project_id: str, service_date: date):
-    rule = services.storage.get_applicable_point_rule(project_id, service_date)
     return rule
 
 
@@ -181,11 +187,13 @@ def get_deduction_rule(deduction_id: str):
 
 @app.post("/api/records", summary="创建服务记录")
 def create_record(req: RecordCreateRequest):
-    record, warnings = services.create_record(
+    record, warnings, error = services.create_record(
         req.participant_name, req.participant_id, req.project_id,
         req.service_date, req.start_time, req.end_time, req.duration_hours,
         req.registered_by, req.quality, req.remarks
     )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
     return {
         "record": record,
         "warnings": warnings
@@ -218,20 +226,28 @@ def get_record(record_id: str):
 
 @app.put("/api/records/{record_id}", response_model=ServiceRecord, summary="更新服务记录")
 def update_record(record_id: str, req: RecordUpdateRequest):
-    record = services.update_record(record_id, **req.dict(exclude_unset=True))
-    if not record:
-        raise HTTPException(status_code=400, detail="记录不存在或状态不允许修改")
+    record, error = services.update_record(record_id, **req.dict(exclude_unset=True))
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return record
+
+
+@app.post("/api/records/{record_id}/submit", response_model=ServiceRecord, summary="提交记录进入待复核")
+def submit_record(record_id: str, req: RecordSubmitRequest):
+    record, error = services.submit_record(record_id, req.operator)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
     return record
 
 
 @app.post("/api/records/{record_id}/review", response_model=ServiceRecord, summary="复核服务记录")
 def review_record(record_id: str, req: RecordReviewRequest):
-    record = services.review_record(
+    record, error = services.review_record(
         record_id, req.reviewer, req.approved,
         req.rejection_reason, req.deduction_rule_id
     )
-    if not record:
-        raise HTTPException(status_code=400, detail="记录不存在或状态不允许复核")
+    if error:
+        raise HTTPException(status_code=400, detail=error)
     return record
 
 

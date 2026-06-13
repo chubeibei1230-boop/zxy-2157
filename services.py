@@ -188,7 +188,9 @@ def _calculate_points(record: ServiceRecord, point_rule: PointRule) -> Tuple[flo
 def create_record(participant_name: str, participant_id: str, project_id: str,
                   service_date: date, start_time: str, end_time: str,
                   duration_hours: float, registered_by: str,
-                  quality: QualityLevel = "合格", remarks: Optional[str] = None) -> Tuple[ServiceRecord, List[str]]:
+                  quality: QualityLevel = "合格", remarks: Optional[str] = None) -> Tuple[Optional[ServiceRecord], List[str], Optional[str]]:
+    if not storage.get_project(project_id):
+        return None, [], "项目不存在，无法登记服务记录"
     record = ServiceRecord(
         record_id=generate_id("rec"),
         participant_name=participant_name,
@@ -200,7 +202,7 @@ def create_record(participant_name: str, participant_id: str, project_id: str,
         duration_hours=duration_hours,
         quality=quality,
         remarks=remarks,
-        status="待复核",
+        status="待登记",
         registered_by=registered_by,
         month=service_date.strftime("%Y-%m")
     )
@@ -229,21 +231,33 @@ def create_record(participant_name: str, participant_id: str, project_id: str,
 
     record.warnings = warnings
     storage.save_record(record)
-    return record, warnings
+    return record, warnings, None
+
+
+def submit_record(record_id: str, operator: str) -> Tuple[Optional[ServiceRecord], Optional[str]]:
+    record = storage.get_record(record_id)
+    if not record:
+        return None, "记录不存在"
+    if record.status != "待登记":
+        return None, f"当前状态为「{record.status}」，只有「待登记」的记录可以提交复核"
+    record.status = "待复核"
+    storage.save_record(record)
+    return record, None
 
 
 def review_record(record_id: str, reviewer: str, approved: bool,
                   rejection_reason: Optional[str] = None,
-                  deduction_rule_id: Optional[str] = None) -> Optional[ServiceRecord]:
+                  deduction_rule_id: Optional[str] = None) -> Tuple[Optional[ServiceRecord], Optional[str]]:
     record = storage.get_record(record_id)
-    if not record or record.status != "待复核":
-        return None
+    if not record:
+        return None, "记录不存在"
+    if record.status != "待复核":
+        return None, f"当前状态为「{record.status}」，只有「待复核」的记录可以复核"
 
     record.reviewed_by = reviewer
     record.reviewed_at = datetime.now()
 
     if approved:
-        record.status = "已计入"
         if not record.applicable_point_rule_id:
             point_rule = storage.get_applicable_point_rule(record.project_id, record.service_date)
             if point_rule:
@@ -256,18 +270,23 @@ def review_record(record_id: str, reviewer: str, approved: bool,
                 record.final_points = record.calculated_points - record.deduction_points
         if deduction_rule_id:
             ded_rule = storage.get_deduction_rule(deduction_rule_id)
-            if ded_rule:
-                record.applicable_deduction_id = ded_rule.deduction_id
-                record.applicable_deduction_version = ded_rule.rule_version
-                record.deduction_points = ded_rule.deduction_points
-                if record.calculated_points is not None:
-                    record.final_points = record.calculated_points - record.deduction_points
+            if not ded_rule:
+                return None, "扣减规则不存在"
+            if ded_rule.effective_date > record.service_date:
+                return None, (f"扣减规则生效日期({ded_rule.effective_date})晚于服务日期({record.service_date})，"
+                              f"不能将该扣减规则应用于此历史记录")
+            record.applicable_deduction_id = ded_rule.deduction_id
+            record.applicable_deduction_version = ded_rule.rule_version
+            record.deduction_points = ded_rule.deduction_points
+            if record.calculated_points is not None:
+                record.final_points = record.calculated_points - record.deduction_points
+        record.status = "已计入"
     else:
         record.status = "已退回"
         record.rejection_reason = rejection_reason or "未说明原因"
 
     storage.save_record(record)
-    return record
+    return record, None
 
 
 def void_record(record_id: str, operator: str) -> Optional[ServiceRecord]:
@@ -282,15 +301,19 @@ def void_record(record_id: str, operator: str) -> Optional[ServiceRecord]:
     return record
 
 
-def update_record(record_id: str, **kwargs) -> Optional[ServiceRecord]:
+def update_record(record_id: str, **kwargs) -> Tuple[Optional[ServiceRecord], Optional[str]]:
     record = storage.get_record(record_id)
-    if not record or record.status not in ["待登记", "已退回"]:
-        return None
+    if not record:
+        return None, "记录不存在"
+    if record.status not in ["待登记", "已退回"]:
+        return None, f"当前状态为「{record.status}」，只有「待登记」或「已退回」的记录可以修改"
     for key, value in kwargs.items():
         if hasattr(record, key) and value is not None:
             setattr(record, key, value)
     if "service_date" in kwargs:
         record.month = record.service_date.strftime("%Y-%m")
+    if kwargs.get("project_id") and not storage.get_project(record.project_id):
+        return None, "目标项目不存在"
 
     warnings = []
     duplicates = detect_duplicate_records(record)
@@ -312,9 +335,13 @@ def update_record(record_id: str, **kwargs) -> Optional[ServiceRecord]:
             record.deduction_points = record.deduction_points or 0.0
             record.final_points = record.calculated_points - record.deduction_points
     record.warnings = warnings
-    record.status = "待复核"
+    if record.status == "已退回":
+        record.status = "待登记"
+    record.rejection_reason = None
+    record.reviewed_by = None
+    record.reviewed_at = None
     storage.save_record(record)
-    return record
+    return record, None
 
 
 # ==================== Query & Filter ====================
