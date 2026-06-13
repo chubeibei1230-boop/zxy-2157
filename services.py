@@ -6,7 +6,8 @@ from collections import defaultdict
 from models import (
     ServiceProject, PointRule, DeductionRule,
     ServiceRecord, MonthlySettlement, QualityLevel,
-    ServiceRecordAppeal, AppealCorrection, TimelineEvent
+    ServiceRecordAppeal, AppealCorrection, TimelineEvent,
+    RecalculationRecord, SettlementOperationLog, SettlementDiffSource
 )
 import storage
 
@@ -308,6 +309,17 @@ def review_record(record_id: str, reviewer: str, approved: bool,
         old_final_points, old_duration, old_status, reviewer
     )
 
+    if record.month:
+        has_change = (abs(old_calc_points - (record.calculated_points or 0.0)) > 0.001 or
+                      abs(old_ded_points - (record.deduction_points or 0.0)) > 0.001 or
+                      abs(old_final_points - (record.final_points or 0.0)) > 0.001 or
+                      old_status != record.status)
+        if has_change:
+            _mark_month_settlements_as_dirty(
+                record.month, record.participant_id, reviewer,
+                f"记录{record.record_id}复核操作"
+            )
+
     return record, None
 
 
@@ -334,6 +346,12 @@ def void_record(record_id: str, operator: str, void_reason: Optional[str] = None
         record, old_calc_points, old_ded_points,
         old_final_points, old_duration, old_status, operator
     )
+
+    if record.month and old_status == "已计入":
+        _mark_month_settlements_as_dirty(
+            record.month, record.participant_id, operator,
+            f"记录{record.record_id}作废处理"
+        )
 
     return record
 
@@ -734,7 +752,10 @@ def run_monthly_settlement(month: str, operator: str) -> Dict:
             deduction_points=round(deduction_points, 2),
             final_points=round(final_points, 2),
             is_official=True,
-            settled_by=operator
+            status="已确认",
+            settled_by=operator,
+            confirmed_at=datetime.now(),
+            confirmed_by=operator
         )
         storage.save_settlement(settlement)
         settlements.append(settlement)
@@ -1016,6 +1037,17 @@ def approve_appeal(appeal_id: str, handler: str,
         old_final_points, old_duration, old_status, handler
     )
 
+    if record.month:
+        has_change = (abs(old_calc_points - (record.calculated_points or 0.0)) > 0.001 or
+                      abs(old_ded_points - (record.deduction_points or 0.0)) > 0.001 or
+                      abs(old_final_points - (record.final_points if record.final_points is not None else 0.0)) > 0.001 or
+                      old_status != record.status)
+        if has_change:
+            _mark_month_settlements_as_dirty(
+                record.month, record.participant_id, handler,
+                f"记录{record.record_id}申诉通过更正"
+            )
+
     new_values = {
         "quality": record.quality,
         "duration_hours": record.duration_hours,
@@ -1284,4 +1316,682 @@ def get_monthly_reconciliation(
         "month": month,
         "total_participants": len(statements),
         "statements": statements,
+    }
+
+
+# ==================== Settlement Diff Detection & Tracking ====================
+
+def compute_current_month_points(month: str, participant_id: str) -> Dict:
+    """计算指定月份某志愿者当前应得的积分（基于最新的记录状态）"""
+    records = query_records(status="已计入", month=month, participant_id=participant_id)
+    total_records = len(records)
+    total_hours = 0.0
+    base_points = 0.0
+    deduction_points = 0.0
+    final_points = 0.0
+    record_details = []
+
+    for r in records:
+        total_hours += r.duration_hours
+        base_pts = r.calculated_points or 0.0
+        ded_pts = r.deduction_points or 0.0
+        fin_pts = r.final_points if r.final_points is not None else base_pts - ded_pts
+        base_points += base_pts
+        deduction_points += ded_pts
+        final_points += fin_pts
+        record_details.append({
+            "record_id": r.record_id,
+            "service_date": r.service_date.isoformat(),
+            "duration_hours": r.duration_hours,
+            "quality": r.quality,
+            "base_points": round(base_pts, 2),
+            "deduction_points": round(ded_pts, 2),
+            "final_points": round(fin_pts, 2),
+            "status": r.status,
+            "reviewed_by": r.reviewed_by,
+            "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
+        })
+
+    return {
+        "month": month,
+        "participant_id": participant_id,
+        "total_records": total_records,
+        "total_hours": round(total_hours, 2),
+        "base_points": round(base_points, 2),
+        "deduction_points": round(deduction_points, 2),
+        "final_points": round(final_points, 2),
+        "record_details": record_details,
+    }
+
+
+def _find_change_sources(month: str, participant_id: str, settlement: MonthlySettlement) -> List[Dict]:
+    """查找导致差异的具体记录和变更来源"""
+    current = compute_current_month_points(month, participant_id)
+    diff_sources = []
+
+    current_records_map = {r["record_id"]: r for r in current["record_details"]}
+
+    all_records = query_records(month=month, participant_id=participant_id)
+    for r in all_records:
+        base_pts = r.calculated_points or 0.0
+        ded_pts = r.deduction_points or 0.0
+        fin_pts = r.final_points if r.final_points is not None else base_pts - ded_pts
+
+        if r.status == "已计入" and r.record_id in current_records_map:
+            pass
+        elif r.status in ["已退回", "作废"]:
+            diff_sources.append({
+                "record_id": r.record_id,
+                "change_type": "记录状态变更",
+                "field_name": "status",
+                "old_value": "已计入",
+                "new_value": r.status,
+                "impact_value": round(-fin_pts, 2),
+                "description": f"记录从「已计入」变更为「{r.status}」，积分减少 {round(fin_pts, 2)}",
+            })
+
+    records_for_settlement = [r for r in all_records if r.status == "已计入"]
+    for r in records_for_settlement:
+        base_pts = r.calculated_points or 0.0
+        ded_pts = r.deduction_points or 0.0
+        fin_pts = r.final_points if r.final_points is not None else base_pts - ded_pts
+
+        appeals = storage.get_appeals_by_record(r.record_id)
+        handled_appeals = [a for a in appeals if a.status == "已通过" and a.correction]
+        for appeal in handled_appeals:
+            changes = []
+            if appeal.original_quality and appeal.original_quality != r.quality:
+                changes.append(f"质量: {appeal.original_quality}→{r.quality}")
+            if appeal.original_duration_hours is not None and abs(appeal.original_duration_hours - r.duration_hours) > 0.001:
+                changes.append(f"时长: {appeal.original_duration_hours}h→{r.duration_hours}h")
+            if appeal.original_final_points is not None and abs(appeal.original_final_points - fin_pts) > 0.001:
+                changes.append(f"最终积分: {appeal.original_final_points}→{fin_pts}")
+            if changes:
+                diff_sources.append({
+                    "record_id": r.record_id,
+                    "change_type": "申诉更正",
+                    "field_name": "appeal_correction",
+                    "old_value": appeal.original_final_points or 0.0,
+                    "new_value": fin_pts,
+                    "impact_value": round(fin_pts - (appeal.original_final_points or 0.0), 2),
+                    "description": f"申诉{appeal.appeal_id}通过导致: {'; '.join(changes)}",
+                })
+
+        if r.applicable_deduction_id:
+            diff_sources.append({
+                "record_id": r.record_id,
+                "change_type": "扣减应用",
+                "field_name": "deduction_points",
+                "old_value": 0.0,
+                "new_value": round(ded_pts, 2),
+                "impact_value": round(-ded_pts, 2),
+                "description": f"应用扣减规则{r.applicable_deduction_version}，扣减{round(ded_pts, 2)}积分",
+            })
+
+    settlement_record_count = settlement.total_records
+    current_record_count = current["total_records"]
+    if settlement_record_count != current_record_count:
+        diff_sources.append({
+            "record_id": "summary",
+            "change_type": "记录数变化",
+            "field_name": "total_records",
+            "old_value": settlement_record_count,
+            "new_value": current_record_count,
+            "impact_value": 0.0,
+            "description": f"记录数从{settlement_record_count}条变为{current_record_count}条",
+        })
+
+    return diff_sources
+
+
+def detect_settlement_diffs(month: str, participant_id: Optional[str] = None) -> Dict:
+    """检测指定月份各志愿者的月度结算与当前应得积分的差异"""
+    settlements = storage.list_settlements()
+    month_settlements = [s for s in settlements if s.month == month and s.is_official]
+
+    if participant_id:
+        month_settlements = [s for s in month_settlements if s.participant_id == participant_id]
+
+    all_participants_current = defaultdict(list)
+    records = query_records(status="已计入", month=month)
+    for r in records:
+        if participant_id and r.participant_id != participant_id:
+            continue
+        all_participants_current[r.participant_id].append(r)
+
+    settlement_map = {}
+    for s in month_settlements:
+        settlement_map[s.participant_id] = s
+
+    all_pids = set(list(settlement_map.keys()) + list(all_participants_current.keys()))
+
+    diff_details = []
+    summary = {
+        "total_participants": len(all_pids),
+        "with_diff": 0,
+        "consistent": 0,
+        "no_settlement": 0,
+    }
+
+    for pid in all_pids:
+        settlement = settlement_map.get(pid)
+        current = compute_current_month_points(month, pid)
+
+        if not settlement:
+            summary["no_settlement"] += 1
+            diff_details.append({
+                "participant_id": pid,
+                "participant_name": current["record_details"][0]["record_id"] if current["record_details"] else "未知",
+                "settlement_id": None,
+                "settlement_status": "未核算",
+                "settlement_version": 0,
+                "old_total_records": 0,
+                "old_total_hours": 0.0,
+                "old_base_points": 0.0,
+                "old_deduction_points": 0.0,
+                "old_final_points": 0.0,
+                "current_total_records": current["total_records"],
+                "current_total_hours": current["total_hours"],
+                "current_base_points": current["base_points"],
+                "current_deduction_points": current["deduction_points"],
+                "current_final_points": current["final_points"],
+                "diff_records_diff": current["total_records"],
+                "diff_hours": current["total_hours"],
+                "diff_base_points": current["base_points"],
+                "diff_deduction_points": current["deduction_points"],
+                "diff_final_points": current["final_points"],
+                "diff_sources": [],
+                "has_diff": current["total_records"] > 0,
+            })
+            if current["total_records"] > 0:
+                summary["with_diff"] += 1
+            continue
+
+        pid_name = settlement.participant_name
+        if current["record_details"]:
+            for r in query_records(participant_id=pid, month=month):
+                pid_name = r.participant_name
+                break
+
+        diff_records = settlement.total_records - current["total_records"]
+        diff_hours = round(settlement.total_hours - current["total_hours"], 2)
+        diff_base = round(settlement.base_points - current["base_points"], 2)
+        diff_ded = round(settlement.deduction_points - current["deduction_points"], 2)
+        diff_final = round(settlement.final_points - current["final_points"], 2)
+
+        has_diff = (abs(diff_records) > 0 or abs(diff_hours) > 0.001 or
+                    abs(diff_base) > 0.001 or abs(diff_ded) > 0.001 or abs(diff_final) > 0.001)
+
+        if has_diff:
+            summary["with_diff"] += 1
+        else:
+            summary["consistent"] += 1
+
+        sources = []
+        if has_diff:
+            sources = _find_change_sources(month, pid, settlement)
+
+        settlement.has_diff = has_diff
+        settlement.last_diff_checked_at = datetime.now()
+        if has_diff and settlement.status == "已确认":
+            settlement.status = "有差异待处理"
+        storage.save_settlement(settlement)
+
+        diff_details.append({
+            "participant_id": pid,
+            "participant_name": pid_name,
+            "settlement_id": settlement.settlement_id,
+            "settlement_status": settlement.status,
+            "settlement_version": settlement.version,
+            "old_total_records": settlement.total_records,
+            "old_total_hours": settlement.total_hours,
+            "old_base_points": settlement.base_points,
+            "old_deduction_points": settlement.deduction_points,
+            "old_final_points": settlement.final_points,
+            "current_total_records": current["total_records"],
+            "current_total_hours": current["total_hours"],
+            "current_base_points": current["base_points"],
+            "current_deduction_points": current["deduction_points"],
+            "current_final_points": current["final_points"],
+            "diff_records_diff": diff_records,
+            "diff_hours": diff_hours,
+            "diff_base_points": diff_base,
+            "diff_deduction_points": diff_ded,
+            "diff_final_points": diff_final,
+            "diff_sources": sources,
+            "has_diff": has_diff,
+        })
+
+    diff_details.sort(key=lambda x: abs(x["diff_final_points"]), reverse=True)
+
+    return {
+        "month": month,
+        "summary": summary,
+        "diffs": diff_details,
+    }
+
+
+# ==================== Settlement Recalculation & Confirmation ====================
+
+def _log_settlement_operation(settlement_id: str, month: str, participant_id: str,
+                              operation_type: str, operator: str, description: str,
+                              details: Optional[str] = None):
+    """记录结算操作日志"""
+    log = SettlementOperationLog(
+        log_id=generate_id("log"),
+        settlement_id=settlement_id,
+        month=month,
+        participant_id=participant_id,
+        operation_type=operation_type,
+        operator=operator,
+        description=description,
+        details=details,
+    )
+    storage.save_settlement_log(log)
+
+
+def _mark_month_settlements_as_dirty(month: str, participant_id: str, operator: str, reason: str):
+    """当记录、复核、申诉等发生变化时，将相关月度结算标记为有差异待处理"""
+    settlements = storage.list_settlements()
+    for s in settlements:
+        if s.month == month and s.participant_id == participant_id and s.is_official:
+            if s.status in ["已确认", "草稿"]:
+                s.status = "有差异待处理"
+            s.has_diff = True
+            s.last_diff_checked_at = datetime.now()
+            storage.save_settlement(s)
+            _log_settlement_operation(
+                settlement_id=s.settlement_id,
+                month=month,
+                participant_id=participant_id,
+                operation_type="差异标记",
+                operator=operator,
+                description=f"因{reason}，系统自动标记为有差异待处理",
+            )
+
+
+def recalculate_settlement(month: str, operator: str, participant_id: Optional[str] = None,
+                           reason: Optional[str] = None) -> Dict:
+    """按月份（可选指定志愿者）发起重新核算"""
+    settlements = storage.list_settlements()
+    target_settlements = [s for s in settlements if s.month == month and s.is_official]
+    if participant_id:
+        target_settlements = [s for s in target_settlements if s.participant_id == participant_id]
+
+    if not target_settlements:
+        return {"error": "该月份没有已确认的月度结算可重算", "recalculated": []}
+
+    records = query_records(status="已计入", month=month)
+    by_participant = defaultdict(list)
+    for r in records:
+        if participant_id and r.participant_id != participant_id:
+            continue
+        by_participant[r.participant_id].append(r)
+
+    recalculated = []
+
+    for old_settlement in target_settlements:
+        pid = old_settlement.participant_id
+        recs = by_participant.get(pid, [])
+
+        total_records = len(recs)
+        total_hours = sum(r.duration_hours for r in recs)
+        base_points = 0.0
+        deduction_points = 0.0
+        final_points = 0.0
+        for r in recs:
+            if r.applicable_point_rule_id:
+                point_rule = storage.get_point_rule(r.applicable_point_rule_id)
+                if point_rule:
+                    multiplier = point_rule.quality_multiplier.get(r.quality, 0.0)
+                    calc = r.duration_hours * point_rule.base_points_per_hour * multiplier
+                    base_points += calc
+                else:
+                    base_points += r.calculated_points or 0.0
+            else:
+                base_points += r.calculated_points or 0.0
+            deduction_points += r.deduction_points or 0.0
+            final_points += r.final_points if r.final_points is not None else ((r.calculated_points or 0.0) - (r.deduction_points or 0.0))
+
+        recalc_record = RecalculationRecord(
+            recalc_id=generate_id("recalc"),
+            operator=operator,
+            old_total_records=old_settlement.total_records,
+            old_total_hours=old_settlement.total_hours,
+            old_base_points=old_settlement.base_points,
+            old_deduction_points=old_settlement.deduction_points,
+            old_final_points=old_settlement.final_points,
+            new_total_records=total_records,
+            new_total_hours=round(total_hours, 2),
+            new_base_points=round(base_points, 2),
+            new_deduction_points=round(deduction_points, 2),
+            new_final_points=round(final_points, 2),
+            reason=reason or "发起重算",
+            diff_sources=[],
+        )
+
+        old_settlement.recalculation_history.append(recalc_record)
+        old_settlement.recalculation_count += 1
+        old_settlement.latest_recalculation_at = datetime.now()
+        old_settlement.latest_recalculation_by = operator
+        old_settlement.total_records = total_records
+        old_settlement.total_hours = round(total_hours, 2)
+        old_settlement.base_points = round(base_points, 2)
+        old_settlement.deduction_points = round(deduction_points, 2)
+        old_settlement.final_points = round(final_points, 2)
+        old_settlement.status = "草稿"
+        old_settlement.has_diff = False
+        old_settlement.settled_at = datetime.now()
+        old_settlement.settled_by = operator
+
+        participant_name = old_settlement.participant_name
+        if recs:
+            participant_name = recs[0].participant_name
+        old_settlement.participant_name = participant_name
+
+        storage.save_settlement(old_settlement)
+
+        _log_settlement_operation(
+            settlement_id=old_settlement.settlement_id,
+            month=month,
+            participant_id=pid,
+            operation_type="发起重算",
+            operator=operator,
+            description=f"发起重新核算，原最终积分{recalc_record.old_final_points}→新最终积分{recalc_record.new_final_points}",
+            details=reason,
+        )
+
+        recalculated.append({
+            "settlement_id": old_settlement.settlement_id,
+            "participant_id": pid,
+            "participant_name": participant_name,
+            "old_final_points": recalc_record.old_final_points,
+            "new_final_points": recalc_record.new_final_points,
+            "diff_final_points": round(recalc_record.new_final_points - recalc_record.old_final_points, 2),
+            "status": old_settlement.status,
+            "version": old_settlement.version,
+            "recalculation_count": old_settlement.recalculation_count,
+        })
+
+    return {
+        "month": month,
+        "recalculated_count": len(recalculated),
+        "recalculated": recalculated,
+    }
+
+
+def confirm_override_settlement(settlement_id: str, operator: str,
+                                note: Optional[str] = None) -> Dict:
+    """核算人员确认覆盖结算结果"""
+    settlement = storage.get_settlement(settlement_id)
+    if not settlement:
+        return {"error": "结算不存在"}
+
+    if settlement.status not in ["草稿", "有差异待处理"]:
+        return {"error": f"当前状态为「{settlement.status}」，只有「草稿」或「有差异待处理」的结算可以确认覆盖"}
+
+    settlement.status = "已确认"
+    settlement.version += 1
+    settlement.is_official = True
+    settlement.confirmed_at = datetime.now()
+    settlement.confirmed_by = operator
+    settlement.has_diff = False
+    settlement.operation_notes = note
+
+    storage.save_settlement(settlement)
+
+    _log_settlement_operation(
+        settlement_id=settlement.settlement_id,
+        month=settlement.month,
+        participant_id=settlement.participant_id,
+        operation_type="确认覆盖",
+        operator=operator,
+        description=f"确认覆盖结算结果，最终积分：{settlement.final_points}，版本升至v{settlement.version}",
+        details=note,
+    )
+
+    return {
+        "settlement_id": settlement.settlement_id,
+        "month": settlement.month,
+        "participant_id": settlement.participant_id,
+        "participant_name": settlement.participant_name,
+        "status": settlement.status,
+        "version": settlement.version,
+        "final_points": settlement.final_points,
+        "confirmed_at": settlement.confirmed_at.isoformat() if settlement.confirmed_at else None,
+        "confirmed_by": settlement.confirmed_by,
+    }
+
+
+def keep_original_settlement(settlement_id: str, operator: str,
+                             reason: Optional[str] = None) -> Dict:
+    """核算人员保留原结算结果（即使有差异）"""
+    settlement = storage.get_settlement(settlement_id)
+    if not settlement:
+        return {"error": "结算不存在"}
+
+    if settlement.status != "有差异待处理":
+        return {"error": f"当前状态为「{settlement.status}」，只有「有差异待处理」的结算可以选择保留原结果"}
+
+    settlement.status = "已确认"
+    settlement.has_diff = False
+    settlement.operation_notes = reason or "经核算，差异不影响原结算有效性，保留原结果"
+
+    storage.save_settlement(settlement)
+
+    _log_settlement_operation(
+        settlement_id=settlement.settlement_id,
+        month=settlement.month,
+        participant_id=settlement.participant_id,
+        operation_type="保留原结果",
+        operator=operator,
+        description=f"确认保留原结算结果，最终积分维持：{settlement.final_points}",
+        details=reason,
+    )
+
+    return {
+        "settlement_id": settlement.settlement_id,
+        "month": settlement.month,
+        "participant_id": settlement.participant_id,
+        "participant_name": settlement.participant_name,
+        "status": settlement.status,
+        "version": settlement.version,
+        "final_points": settlement.final_points,
+        "note": settlement.operation_notes,
+    }
+
+
+# ==================== Settlement History & Audit Trail ====================
+
+def get_settlement_timeline(settlement_id: str) -> Optional[Dict]:
+    """获取某个结算的完整时间线（形成过程与调整原因）"""
+    settlement = storage.get_settlement(settlement_id)
+    if not settlement:
+        return None
+
+    logs = storage.list_settlement_logs(settlement_id=settlement_id)
+
+    timeline_events = []
+
+    timeline_events.append({
+        "event_type": "生成结算",
+        "operator": settlement.settled_by,
+        "operated_at": settlement.settled_at.isoformat() if settlement.settled_at else None,
+        "description": f"初次生成月度结算，最终积分：{settlement.final_points}",
+    })
+
+    for recalc in settlement.recalculation_history:
+        timeline_events.append({
+            "event_type": "发起重算",
+            "operator": recalc.operator,
+            "operated_at": recalc.recalculated_at.isoformat() if recalc.recalculated_at else None,
+            "description": (f"发起重算：最终积分 {recalc.old_final_points} → {recalc.new_final_points}，"
+                           f"原因：{recalc.reason or '未说明'}"),
+            "details": {
+                "old": {
+                    "total_records": recalc.old_total_records,
+                    "total_hours": recalc.old_total_hours,
+                    "base_points": recalc.old_base_points,
+                    "deduction_points": recalc.old_deduction_points,
+                    "final_points": recalc.old_final_points,
+                },
+                "new": {
+                    "total_records": recalc.new_total_records,
+                    "total_hours": recalc.new_total_hours,
+                    "base_points": recalc.new_base_points,
+                    "deduction_points": recalc.new_deduction_points,
+                    "final_points": recalc.new_final_points,
+                },
+            }
+        })
+
+    for log in logs:
+        if log.operation_type not in ["发起重算"]:
+            timeline_events.append({
+                "event_type": log.operation_type,
+                "operator": log.operator,
+                "operated_at": log.operated_at.isoformat() if log.operated_at else None,
+                "description": log.description,
+                "details": log.details,
+            })
+
+    if settlement.confirmed_at:
+        timeline_events.append({
+            "event_type": "确认结算",
+            "operator": settlement.confirmed_by,
+            "operated_at": settlement.confirmed_at.isoformat() if settlement.confirmed_at else None,
+            "description": f"结算已确认为正式结果，版本v{settlement.version}",
+        })
+
+    timeline_events.sort(key=lambda e: e.get("operated_at") or "")
+
+    settlement_records = query_records(status="已计入", month=settlement.month, participant_id=settlement.participant_id)
+    appeal_changes = []
+    for r in settlement_records:
+        appeals = storage.get_appeals_by_record(r.record_id)
+        for a in appeals:
+            if a.status == "已通过":
+                appeal_changes.append({
+                    "appeal_id": a.appeal_id,
+                    "record_id": r.record_id,
+                    "service_date": r.service_date.isoformat(),
+                    "submitted_by": a.submitted_by,
+                    "submitted_at": a.submitted_at.isoformat() if a.submitted_at else None,
+                    "handler": a.handler,
+                    "handled_at": a.handled_at.isoformat() if a.handled_at else None,
+                    "appeal_reason": a.appeal_reason,
+                    "handle_note": a.handle_note,
+                    "correction": a.correction.dict() if a.correction else None,
+                })
+
+    return {
+        "settlement": {
+            "settlement_id": settlement.settlement_id,
+            "month": settlement.month,
+            "participant_id": settlement.participant_id,
+            "participant_name": settlement.participant_name,
+            "status": settlement.status,
+            "version": settlement.version,
+            "is_official": settlement.is_official,
+            "total_records": settlement.total_records,
+            "total_hours": settlement.total_hours,
+            "base_points": settlement.base_points,
+            "deduction_points": settlement.deduction_points,
+            "final_points": settlement.final_points,
+            "has_diff": settlement.has_diff,
+            "recalculation_count": settlement.recalculation_count,
+            "confirmed_by": settlement.confirmed_by,
+            "confirmed_at": settlement.confirmed_at.isoformat() if settlement.confirmed_at else None,
+            "settled_by": settlement.settled_by,
+            "settled_at": settlement.settled_at.isoformat() if settlement.settled_at else None,
+            "operation_notes": settlement.operation_notes,
+        },
+        "timeline": timeline_events,
+        "operation_logs": [l.dict() for l in logs],
+        "recalculation_history": [r.dict() for r in settlement.recalculation_history],
+        "appeal_changes": appeal_changes,
+    }
+
+
+def get_volunteer_month_settlement_history(month: str, participant_id: str) -> Dict:
+    """查看某位志愿者在某个月的积分形成过程与调整原因"""
+    diff_result = detect_settlement_diffs(month, participant_id)
+    current = compute_current_month_points(month, participant_id)
+
+    settlements = storage.list_settlements()
+    target_settlements = [s for s in settlements if s.month == month and s.participant_id == participant_id]
+    target_settlements.sort(key=lambda s: s.settled_at or datetime.min)
+
+    settlement_ids = [s.settlement_id for s in target_settlements]
+    all_logs = storage.list_settlement_logs(month=month, participant_id=participant_id)
+
+    settlement_timelines = []
+    for sid in settlement_ids:
+        tl = get_settlement_timeline(sid)
+        if tl:
+            settlement_timelines.append(tl)
+
+    all_appeals = []
+    records = query_records(month=month, participant_id=participant_id)
+    for r in records:
+        appeals = storage.get_appeals_by_record(r.record_id)
+        for a in appeals:
+            all_appeals.append({
+                "appeal_id": a.appeal_id,
+                "record_id": r.record_id,
+                "status": a.status,
+                "appeal_reason": a.appeal_reason,
+                "submitted_by": a.submitted_by,
+                "submitted_at": a.submitted_at.isoformat() if a.submitted_at else None,
+                "handler": a.handler,
+                "handled_at": a.handled_at.isoformat() if a.handled_at else None,
+                "handle_note": a.handle_note,
+                "rejection_reason": a.rejection_reason,
+                "correction": a.correction.dict() if a.correction else None,
+                "original_values": {
+                    "quality": a.original_quality,
+                    "duration_hours": a.original_duration_hours,
+                    "final_points": a.original_final_points,
+                    "deduction_points": a.original_deduction_points,
+                    "status": a.original_status,
+                }
+            })
+
+    return {
+        "month": month,
+        "participant_id": participant_id,
+        "participant_name": records[0].participant_name if records else (
+            current["record_details"][0].get("participant_name", "未知") if current["record_details"] else "未知"
+        ),
+        "current_points": {
+            "total_records": current["total_records"],
+            "total_hours": current["total_hours"],
+            "base_points": current["base_points"],
+            "deduction_points": current["deduction_points"],
+            "final_points": current["final_points"],
+        },
+        "record_details": current["record_details"],
+        "diff_check": diff_result,
+        "settlements": [
+            {
+                "settlement_id": s.settlement_id,
+                "status": s.status,
+                "version": s.version,
+                "is_official": s.is_official,
+                "total_records": s.total_records,
+                "total_hours": s.total_hours,
+                "base_points": s.base_points,
+                "deduction_points": s.deduction_points,
+                "final_points": s.final_points,
+                "settled_at": s.settled_at.isoformat() if s.settled_at else None,
+                "settled_by": s.settled_by,
+                "confirmed_at": s.confirmed_at.isoformat() if s.confirmed_at else None,
+                "confirmed_by": s.confirmed_by,
+                "recalculation_count": s.recalculation_count,
+                "has_diff": s.has_diff,
+            } for s in target_settlements
+        ],
+        "settlement_timelines": settlement_timelines,
+        "operation_logs": [l.dict() for l in all_logs],
+        "appeals": all_appeals,
     }

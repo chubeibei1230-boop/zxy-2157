@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 RecordStatus = Literal["待登记", "待复核", "已计入", "已退回", "作废"]
 QualityLevel = Literal["优秀", "良好", "合格", "不合格"]
 AppealStatus = Literal["待处理", "处理中", "已通过", "已驳回"]
+SettlementStatus = Literal["草稿", "已确认", "已废弃", "有差异待处理"]
+SettlementOperationType = Literal["生成结算", "发起重算", "确认覆盖", "保留原结果", "确认结算", "废弃结算"]
 
 
 class AppealCorrection(BaseModel):
@@ -117,6 +119,72 @@ class ServiceRecord(BaseModel):
     warnings: Optional[List[str]] = Field(default_factory=list)
 
 
+class RecalculationRecord(BaseModel):
+    recalc_id: str
+    operator: str
+    recalculated_at: datetime = Field(default_factory=datetime.now)
+    old_total_records: int = 0
+    old_total_hours: float = 0.0
+    old_base_points: float = 0.0
+    old_deduction_points: float = 0.0
+    old_final_points: float = 0.0
+    new_total_records: int = 0
+    new_total_hours: float = 0.0
+    new_base_points: float = 0.0
+    new_deduction_points: float = 0.0
+    new_final_points: float = 0.0
+    reason: Optional[str] = None
+    diff_sources: List[str] = Field(default_factory=list)
+
+
+class SettlementOperationLog(BaseModel):
+    log_id: str
+    settlement_id: str
+    month: str
+    participant_id: str
+    operation_type: str
+    operator: str
+    operated_at: datetime = Field(default_factory=datetime.now)
+    description: str
+    details: Optional[str] = None
+
+
+class SettlementDiffSource(BaseModel):
+    record_id: str
+    participant_id: str
+    participant_name: str
+    change_type: str
+    field_name: Optional[str] = None
+    old_value: Optional[float] = 0.0
+    new_value: Optional[float] = 0.0
+    impact_value: Optional[float] = 0.0
+    description: Optional[str] = None
+
+
+class SettlementDiffDetail(BaseModel):
+    participant_id: str
+    participant_name: str
+    settlement_id: Optional[str] = None
+    settlement_status: Optional[str] = None
+    settlement_version: Optional[int] = 0
+    old_total_records: int = 0
+    old_total_hours: float = 0.0
+    old_base_points: float = 0.0
+    old_deduction_points: float = 0.0
+    old_final_points: float = 0.0
+    current_total_records: int = 0
+    current_total_hours: float = 0.0
+    current_base_points: float = 0.0
+    current_deduction_points: float = 0.0
+    current_final_points: float = 0.0
+    diff_records_diff: int = 0
+    diff_hours: float = 0.0
+    diff_base_points: float = 0.0
+    diff_deduction_points: float = 0.0
+    diff_final_points: float = 0.0
+    diff_sources: List[SettlementDiffSource] = Field(default_factory=list)
+
+
 class MonthlySettlement(BaseModel):
     settlement_id: str
     month: str
@@ -130,3 +198,14 @@ class MonthlySettlement(BaseModel):
     is_official: bool = False
     settled_at: datetime = Field(default_factory=datetime.now)
     settled_by: str
+    status: str = "草稿"
+    version: int = 1
+    confirmed_at: Optional[datetime] = None
+    confirmed_by: Optional[str] = None
+    recalculation_count: int = 0
+    latest_recalculation_at: Optional[datetime] = None
+    latest_recalculation_by: Optional[str] = None
+    operation_notes: Optional[str] = None
+    recalculation_history: List[RecalculationRecord] = Field(default_factory=list)
+    has_diff: bool = False
+    last_diff_checked_at: Optional[datetime] = None

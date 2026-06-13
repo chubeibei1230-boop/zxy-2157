@@ -134,6 +134,28 @@ class AppealRejectRequest(BaseModel):
     handle_note: Optional[str] = None
 
 
+class SettlementDiffDetectRequest(BaseModel):
+    month: str
+    participant_id: Optional[str] = None
+
+
+class SettlementRecalculateRequest(BaseModel):
+    month: str
+    operator: str
+    participant_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class SettlementConfirmOverrideRequest(BaseModel):
+    operator: str
+    note: Optional[str] = None
+
+
+class SettlementKeepOriginalRequest(BaseModel):
+    operator: str
+    reason: Optional[str] = None
+
+
 # ==================== Project APIs ====================
 
 @app.post("/api/projects", response_model=ServiceProject, summary="创建服务项目")
@@ -559,6 +581,83 @@ def reject_appeal(appeal_id: str, req: AppealRejectRequest):
 @app.get("/api/records/{record_id}/appeals", response_model=List[ServiceRecordAppeal], summary="获取某记录的申诉列表")
 def get_record_appeals(record_id: str):
     return services.get_appeals_by_record(record_id)
+
+
+# ==================== Settlement Diff Detection & Tracking APIs ====================
+
+@app.post("/api/settlements/detect-diffs", summary="检测月度结算差异")
+def detect_settlement_diffs(req: SettlementDiffDetectRequest):
+    return services.detect_settlement_diffs(
+        month=req.month,
+        participant_id=req.participant_id
+    )
+
+
+@app.get("/api/settlements/diffs", summary="查询月度结算差异（GET方式）")
+def get_settlement_diffs(
+    month: str = Query(..., description="月份，格式 YYYY-MM"),
+    participant_id: Optional[str] = Query(None, description="参与人ID")
+):
+    return services.detect_settlement_diffs(
+        month=month,
+        participant_id=participant_id
+    )
+
+
+@app.post("/api/settlements/recalculate", summary="按月份发起重新核算")
+def recalculate_settlement(req: SettlementRecalculateRequest):
+    result = services.recalculate_settlement(
+        month=req.month,
+        operator=req.operator,
+        participant_id=req.participant_id,
+        reason=req.reason
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/settlements/{settlement_id}/confirm-override", summary="确认覆盖结算结果")
+def confirm_override_settlement(settlement_id: str, req: SettlementConfirmOverrideRequest):
+    result = services.confirm_override_settlement(
+        settlement_id=settlement_id,
+        operator=req.operator,
+        note=req.note
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/settlements/{settlement_id}/keep-original", summary="保留原结算结果")
+def keep_original_settlement(settlement_id: str, req: SettlementKeepOriginalRequest):
+    result = services.keep_original_settlement(
+        settlement_id=settlement_id,
+        operator=req.operator,
+        reason=req.reason
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/api/settlements/{settlement_id}/timeline", summary="获取结算时间线（形成过程与调整原因）")
+def get_settlement_timeline(settlement_id: str):
+    result = services.get_settlement_timeline(settlement_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="结算不存在")
+    return result
+
+
+@app.get("/api/settlements/volunteer-history", summary="查看志愿者月度积分形成过程与调整原因")
+def get_volunteer_month_settlement_history(
+    month: str = Query(..., description="月份，格式 YYYY-MM"),
+    participant_id: str = Query(..., description="参与人ID")
+):
+    return services.get_volunteer_month_settlement_history(
+        month=month,
+        participant_id=participant_id
+    )
 
 
 # ==================== Monthly Reconciliation Statement APIs ====================

@@ -5,7 +5,8 @@ from datetime import date, datetime
 from typing import List, Optional, Dict, Any
 from models import (
     ServiceProject, PointRule, DeductionRule,
-    ServiceRecord, MonthlySettlement, ServiceRecordAppeal, AppealCorrection, TimelineEvent
+    ServiceRecord, MonthlySettlement, ServiceRecordAppeal, AppealCorrection, TimelineEvent,
+    SettlementOperationLog, RecalculationRecord
 )
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -16,6 +17,7 @@ DEDUCTION_RULES_FILE = os.path.join(DATA_DIR, "deduction_rules.csv")
 RECORDS_FILE = os.path.join(DATA_DIR, "service_records.csv")
 SETTLEMENTS_FILE = os.path.join(DATA_DIR, "monthly_settlements.csv")
 APPEALS_FILE = os.path.join(DATA_DIR, "service_record_appeals.csv")
+SETTLEMENT_LOGS_FILE = os.path.join(DATA_DIR, "settlement_operation_logs.csv")
 
 
 def _ensure_data_dir():
@@ -40,7 +42,10 @@ def _init_csv_files():
                        "final_points", "month", "warnings"],
         SETTLEMENTS_FILE: ["settlement_id", "month", "participant_id", "participant_name",
                            "total_records", "total_hours", "base_points", "deduction_points",
-                           "final_points", "is_official", "settled_at", "settled_by"],
+                           "final_points", "is_official", "settled_at", "settled_by",
+                           "status", "version", "confirmed_at", "confirmed_by",
+                           "recalculation_count", "latest_recalculation_at", "latest_recalculation_by",
+                           "operation_notes", "recalculation_history", "has_diff", "last_diff_checked_at"],
         APPEALS_FILE: ["appeal_id", "record_id", "participant_id", "participant_name",
                        "project_id", "service_date", "month", "appeal_reason",
                        "supplementary_note", "expected_result", "status",
@@ -48,7 +53,10 @@ def _init_csv_files():
                        "handle_note", "rejection_reason", "correction",
                        "original_calculated_points", "original_deduction_points",
                        "original_final_points", "original_quality",
-                       "original_duration_hours", "original_status", "timeline"]
+                       "original_duration_hours", "original_status", "timeline"],
+        SETTLEMENT_LOGS_FILE: ["log_id", "settlement_id", "month", "participant_id",
+                               "operation_type", "operator", "operated_at",
+                               "description", "details"]
     }
     for filepath, headers in files.items():
         if not os.path.exists(filepath):
@@ -312,22 +320,40 @@ def save_record(record: ServiceRecord):
 
 def list_settlements() -> List[MonthlySettlement]:
     rows = _read_csv(SETTLEMENTS_FILE)
-    return [
-        MonthlySettlement(
+    settlements = []
+    for r in rows:
+        recalc_history_raw = _parse_json(r.get("recalculation_history", ""))
+        recalc_history = []
+        if isinstance(recalc_history_raw, list):
+            for rh in recalc_history_raw:
+                if isinstance(rh, dict):
+                    recalc_history.append(RecalculationRecord(**rh))
+        settlements.append(MonthlySettlement(
             settlement_id=r["settlement_id"],
             month=r["month"],
             participant_id=r["participant_id"],
             participant_name=r["participant_name"],
-            total_records=int(r["total_records"]),
-            total_hours=float(r["total_hours"]),
-            base_points=float(r["base_points"]),
-            deduction_points=float(r["deduction_points"]),
-            final_points=float(r["final_points"]),
+            total_records=int(r.get("total_records", 0)),
+            total_hours=float(r.get("total_hours", 0.0)),
+            base_points=float(r.get("base_points", 0.0)),
+            deduction_points=float(r.get("deduction_points", 0.0)),
+            final_points=float(r.get("final_points", 0.0)),
             is_official=_parse_bool(r.get("is_official", "false")),
-            settled_at=_parse_datetime(r["settled_at"]),
-            settled_by=r["settled_by"]
-        ) for r in rows
-    ]
+            settled_at=_parse_datetime(r.get("settled_at", "")),
+            settled_by=r.get("settled_by", ""),
+            status=r.get("status", "草稿"),
+            version=int(r.get("version", 1)),
+            confirmed_at=_parse_datetime(r.get("confirmed_at", "")),
+            confirmed_by=r.get("confirmed_by") or None,
+            recalculation_count=int(r.get("recalculation_count", 0)),
+            latest_recalculation_at=_parse_datetime(r.get("latest_recalculation_at", "")),
+            latest_recalculation_by=r.get("latest_recalculation_by") or None,
+            operation_notes=r.get("operation_notes") or None,
+            recalculation_history=recalc_history,
+            has_diff=_parse_bool(r.get("has_diff", "false")),
+            last_diff_checked_at=_parse_datetime(r.get("last_diff_checked_at", ""))
+        ))
+    return settlements
 
 
 def save_settlement(settlement: MonthlySettlement):
@@ -340,16 +366,29 @@ def save_settlement(settlement: MonthlySettlement):
         settlements.append(settlement)
     headers = ["settlement_id", "month", "participant_id", "participant_name",
                "total_records", "total_hours", "base_points", "deduction_points",
-               "final_points", "is_official", "settled_at", "settled_by"]
+               "final_points", "is_official", "settled_at", "settled_by",
+               "status", "version", "confirmed_at", "confirmed_by",
+               "recalculation_count", "latest_recalculation_at", "latest_recalculation_by",
+               "operation_notes", "recalculation_history", "has_diff", "last_diff_checked_at"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
+
+
+def get_settlement(settlement_id: str) -> Optional[MonthlySettlement]:
+    for s in list_settlements():
+        if s.settlement_id == settlement_id:
+            return s
+    return None
 
 
 def delete_settlements_by_month(month: str):
     settlements = [s for s in list_settlements() if s.month != month]
     headers = ["settlement_id", "month", "participant_id", "participant_name",
                "total_records", "total_hours", "base_points", "deduction_points",
-               "final_points", "is_official", "settled_at", "settled_by"]
+               "final_points", "is_official", "settled_at", "settled_by",
+               "status", "version", "confirmed_at", "confirmed_by",
+               "recalculation_count", "latest_recalculation_at", "latest_recalculation_by",
+               "operation_notes", "recalculation_history", "has_diff", "last_diff_checked_at"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
 
@@ -358,7 +397,10 @@ def delete_settlement(settlement_id: str):
     settlements = [s for s in list_settlements() if s.settlement_id != settlement_id]
     headers = ["settlement_id", "month", "participant_id", "participant_name",
                "total_records", "total_hours", "base_points", "deduction_points",
-               "final_points", "is_official", "settled_at", "settled_by"]
+               "final_points", "is_official", "settled_at", "settled_by",
+               "status", "version", "confirmed_at", "confirmed_by",
+               "recalculation_count", "latest_recalculation_at", "latest_recalculation_by",
+               "operation_notes", "recalculation_history", "has_diff", "last_diff_checked_at"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
 
@@ -437,3 +479,44 @@ def save_appeal(appeal: ServiceRecordAppeal):
                "original_duration_hours", "original_status", "timeline"]
     rows = [a.dict() for a in appeals]
     _write_csv(APPEALS_FILE, headers, rows)
+
+
+# ==================== Settlement Operation Logs ====================
+
+def _row_to_settlement_log(r: Dict) -> SettlementOperationLog:
+    return SettlementOperationLog(
+        log_id=r["log_id"],
+        settlement_id=r["settlement_id"],
+        month=r["month"],
+        participant_id=r["participant_id"],
+        operation_type=r["operation_type"],
+        operator=r["operator"],
+        operated_at=_parse_datetime(r.get("operated_at", "")),
+        description=r.get("description", ""),
+        details=r.get("details") or None
+    )
+
+
+def list_settlement_logs(settlement_id: Optional[str] = None,
+                          month: Optional[str] = None,
+                          participant_id: Optional[str] = None) -> List[SettlementOperationLog]:
+    rows = _read_csv(SETTLEMENT_LOGS_FILE)
+    logs = [_row_to_settlement_log(r) for r in rows]
+    if settlement_id:
+        logs = [l for l in logs if l.settlement_id == settlement_id]
+    if month:
+        logs = [l for l in logs if l.month == month]
+    if participant_id:
+        logs = [l for l in logs if l.participant_id == participant_id]
+    logs.sort(key=lambda l: l.operated_at, reverse=True)
+    return logs
+
+
+def save_settlement_log(log: SettlementOperationLog):
+    logs = list_settlement_logs()
+    logs.append(log)
+    headers = ["log_id", "settlement_id", "month", "participant_id",
+               "operation_type", "operator", "operated_at",
+               "description", "details"]
+    rows = [l.dict() for l in logs]
+    _write_csv(SETTLEMENT_LOGS_FILE, headers, rows)
