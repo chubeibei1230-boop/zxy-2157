@@ -1,6 +1,6 @@
 import uuid
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Literal
 from collections import defaultdict
 
 from models import (

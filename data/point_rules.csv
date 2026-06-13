@@ -1,3 +1,4 @@
 ﻿rule_id,rule_version,project_id,base_points_per_hour,quality_multiplier,effective_date,description,created_at,created_by
 prule_59347eba1132,v1,proj_c9fdaf332618,12.0,"{""优秀"": 1.5, ""良好"": 1.2, ""合格"": 1.0, ""不合格"": 0.0}",2026-01-01,,2026-06-13T14:12:57.383660,admin
 prule_0a2e2de4aeee,v2,proj_c9fdaf332618,18.0,"{""优秀"": 1.5, ""良好"": 1.2, ""合格"": 1.0, ""不合格"": 0.0}",2026-06-01,,2026-06-13T14:12:59.448491,admin
+prule_7797e3439095,v1,proj_53366ac9e46f,10.0,"{""优秀"": 1.5, ""良好"": 1.2, ""合格"": 1.0, ""不合格"": 0.0}",2024-01-01,测试积分规则,2026-06-13T16:13:24.083620,admin
