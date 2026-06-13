@@ -256,6 +256,12 @@ def review_record(record_id: str, reviewer: str, approved: bool,
     if record.status != "待复核":
         return None, f"当前状态为「{record.status}」，只有「待复核」的记录可以复核"
 
+    has_anomaly = record.warnings is not None and len(record.warnings) > 0
+    if has_anomaly and approved and not review_note:
+        return None, "该记录存在异常，必须填写复核备注说明异常处理情况"
+    if not approved and not rejection_reason:
+        return None, "退回记录必须填写退回原因"
+
     old_calc_points = record.calculated_points or 0.0
     old_ded_points = record.deduction_points or 0.0
     old_final_points = record.final_points if record.final_points is not None else old_calc_points - old_ded_points
@@ -291,7 +297,7 @@ def review_record(record_id: str, reviewer: str, approved: bool,
         record.status = "已计入"
     else:
         record.status = "已退回"
-        record.rejection_reason = rejection_reason or "未说明原因"
+        record.rejection_reason = rejection_reason
 
     record.review_note = review_note
 
@@ -338,6 +344,9 @@ def update_record(record_id: str, **kwargs) -> Tuple[Optional[ServiceRecord], Op
         return None, "记录不存在"
     if record.status not in ["待登记", "已退回"]:
         return None, f"当前状态为「{record.status}」，只有「待登记」或「已退回」的记录可以修改"
+    
+    project_changed = "project_id" in kwargs and kwargs["project_id"] != record.project_id
+    
     for key, value in kwargs.items():
         if hasattr(record, key) and value is not None:
             setattr(record, key, value)
@@ -345,6 +354,15 @@ def update_record(record_id: str, **kwargs) -> Tuple[Optional[ServiceRecord], Op
         record.month = record.service_date.strftime("%Y-%m")
     if kwargs.get("project_id") and not storage.get_project(record.project_id):
         return None, "目标项目不存在"
+
+    if project_changed:
+        record.applicable_point_rule_id = None
+        record.applicable_point_version = None
+        record.applicable_deduction_id = None
+        record.applicable_deduction_version = None
+        record.calculated_points = None
+        record.deduction_points = None
+        record.final_points = None
 
     warnings = []
     duplicates = detect_duplicate_records(record)
@@ -356,6 +374,11 @@ def update_record(record_id: str, **kwargs) -> Tuple[Optional[ServiceRecord], Op
         warnings.append(f"时长异常: {duration_msg}")
     if detect_missing_rules(record):
         warnings.append("规则缺失: 该项目在服务日期无可用积分规则")
+        record.applicable_point_rule_id = None
+        record.applicable_point_version = None
+        record.calculated_points = None
+        record.deduction_points = None
+        record.final_points = None
     else:
         point_rule = storage.get_applicable_point_rule(record.project_id, record.service_date)
         if point_rule:
@@ -371,6 +394,7 @@ def update_record(record_id: str, **kwargs) -> Tuple[Optional[ServiceRecord], Op
     record.rejection_reason = None
     record.reviewed_by = None
     record.reviewed_at = None
+    record.review_note = None
     storage.save_record(record)
     return record, None
 
@@ -467,11 +491,12 @@ def query_pending_review(
 
     anomaly_stats = {
         "total_pending": len(query_records(status="待复核")),
-        "duplicate_count": len([r for r in query_records(status="待复核")
+        "filtered_total": len(records),
+        "duplicate_count": len([r for r in records
                                 if any("疑似重复登记" in w for w in (r.warnings or []))]),
-        "duration_anomaly_count": len([r for r in query_records(status="待复核")
+        "duration_anomaly_count": len([r for r in records
                                        if any("时长异常" in w for w in (r.warnings or []))]),
-        "missing_rule_count": len([r for r in query_records(status="待复核")
+        "missing_rule_count": len([r for r in records
                                    if any("规则缺失" in w for w in (r.warnings or []))]),
     }
 
@@ -915,7 +940,11 @@ def _update_settlement_after_correction(record: ServiceRecord,
 
     target_settlement.settled_at = datetime.now()
     target_settlement.settled_by = operator
-    storage.save_settlement(target_settlement)
+    
+    if target_settlement.total_records <= 0:
+        storage.delete_settlement(target_settlement.settlement_id)
+    else:
+        storage.save_settlement(target_settlement)
 
 
 def approve_appeal(appeal_id: str, handler: str,

@@ -353,6 +353,15 @@ def delete_settlements_by_month(month: str):
     _write_csv(SETTLEMENTS_FILE, headers, rows)
 
 
+def delete_settlement(settlement_id: str):
+    settlements = [s for s in list_settlements() if s.settlement_id != settlement_id]
+    headers = ["settlement_id", "month", "participant_id", "participant_name",
+               "total_records", "total_hours", "base_points", "deduction_points",
+               "final_points", "settled_at", "settled_by"]
+    rows = [s.dict() for s in settlements]
+    _write_csv(SETTLEMENTS_FILE, headers, rows)
+
+
 # ==================== Service Record Appeals ====================
 
 def _row_to_appeal(r: Dict) -> ServiceRecordAppeal:
