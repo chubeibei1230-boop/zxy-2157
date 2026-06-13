@@ -561,6 +561,97 @@ def get_record_appeals(record_id: str):
     return services.get_appeals_by_record(record_id)
 
 
+# ==================== Monthly Reconciliation Statement APIs ====================
+
+@app.get("/api/reconciliation", summary="查询个人月度积分对账单")
+def get_monthly_reconciliation(
+    month: str = Query(..., description="月份，格式 YYYY-MM"),
+    participant_id: Optional[str] = Query(None, description="参与人ID"),
+    participant_name: Optional[str] = Query(None, description="参与人姓名（模糊匹配）")
+):
+    return services.get_monthly_reconciliation(
+        month=month,
+        participant_id=participant_id,
+        participant_name=participant_name
+    )
+
+
+@app.get("/api/export/reconciliation", summary="导出个人月度积分对账单CSV")
+def export_reconciliation_csv(
+    month: str = Query(..., description="月份，格式 YYYY-MM"),
+    participant_id: Optional[str] = Query(None, description="参与人ID"),
+    participant_name: Optional[str] = Query(None, description="参与人姓名（模糊匹配）")
+):
+    result = services.get_monthly_reconciliation(
+        month=month,
+        participant_id=participant_id,
+        participant_name=participant_name
+    )
+    import csv
+    from io import StringIO
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "月份", "参与人ID", "参与人姓名",
+        "记录ID", "服务日期", "项目ID", "项目名称",
+        "服务时长(小时)", "质量等级", "基础积分", "扣减积分", "最终积分",
+        "复核结果", "复核人", "复核时间",
+        "申诉积分变化说明",
+        "汇总-记录数", "汇总-总时长", "汇总-基础积分", "汇总-扣减积分", "汇总-最终积分",
+        "核算一致性"
+    ])
+    for stmt in result["statements"]:
+        for i, detail in enumerate(stmt["details"]):
+            appeal_desc_parts = []
+            for ac in detail["appeal_changes"]:
+                if ac["status"] == "已通过":
+                    appeal_desc_parts.append(
+                        f"申诉{ac['appeal_id']}通过: {'; '.join(ac['changes']) or '无变更'}"
+                    )
+                elif ac["status"] == "已驳回":
+                    appeal_desc_parts.append(
+                        f"申诉{ac['appeal_id']}驳回: {ac.get('rejection_reason', '')}"
+                    )
+            appeal_desc = " | ".join(appeal_desc_parts) if appeal_desc_parts else ""
+
+            consistency = ""
+            if i == 0 and stmt.get("consistency_check"):
+                consistency = "一致" if stmt["consistency_check"]["is_consistent"] else "不一致"
+
+            writer.writerow([
+                stmt["month"] if i == 0 else "",
+                stmt["participant_id"] if i == 0 else "",
+                stmt["participant_name"] if i == 0 else "",
+                detail["record_id"],
+                detail["service_date"],
+                detail["project_id"],
+                detail["project_name"],
+                detail["duration_hours"],
+                detail["quality"],
+                detail["base_points"],
+                detail["deduction_points"],
+                detail["final_points"],
+                detail["review_result"],
+                detail["reviewed_by"] or "",
+                detail["reviewed_at"] or "",
+                appeal_desc,
+                stmt["summary"]["total_records"] if i == 0 else "",
+                stmt["summary"]["total_hours"] if i == 0 else "",
+                stmt["summary"]["base_points"] if i == 0 else "",
+                stmt["summary"]["deduction_points"] if i == 0 else "",
+                stmt["summary"]["final_points"] if i == 0 else "",
+                consistency,
+            ])
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8-sig",
+        headers={
+            "Content-Disposition": f"attachment; filename=reconciliation_{month}_{datetime.now().strftime('%Y%m%d')}.csv"
+        }
+    )
+
+
 @app.get("/", summary="系统健康检查")
 def root():
     return {

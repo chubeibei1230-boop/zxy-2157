@@ -1064,3 +1064,161 @@ def reject_appeal(appeal_id: str, handler: str,
 
 def get_appeals_by_record(record_id: str) -> List[ServiceRecordAppeal]:
     return storage.get_appeals_by_record(record_id)
+
+
+# ==================== Monthly Reconciliation Statement ====================
+
+def get_monthly_reconciliation(
+    month: str,
+    participant_id: Optional[str] = None,
+    participant_name: Optional[str] = None
+) -> Dict:
+    records = query_records(status="已计入", month=month)
+
+    project_map = {p.project_id: p.project_name for p in storage.list_projects()}
+
+    by_participant = defaultdict(list)
+    for r in records:
+        by_participant[r.participant_id].append(r)
+
+    if participant_id:
+        by_participant = {k: v for k, v in by_participant.items() if k == participant_id}
+    if participant_name:
+        by_participant = {
+            k: v for k, v in by_participant.items()
+            if any(participant_name in r.participant_name for r in v)
+        }
+
+    settlements = storage.list_settlements()
+    settlement_map = {}
+    for s in settlements:
+        if s.month == month:
+            settlement_map[s.participant_id] = s
+
+    statements = []
+    for pid, recs in by_participant.items():
+        recs.sort(key=lambda r: r.service_date)
+        participant_name_val = recs[0].participant_name
+
+        detail_lines = []
+        total_hours = 0.0
+        total_base_points = 0.0
+        total_deduction_points = 0.0
+        total_final_points = 0.0
+
+        for r in recs:
+            total_hours += r.duration_hours
+            base_pts = r.calculated_points or 0.0
+            ded_pts = r.deduction_points or 0.0
+            fin_pts = r.final_points if r.final_points is not None else base_pts - ded_pts
+            total_base_points += base_pts
+            total_deduction_points += ded_pts
+            total_final_points += fin_pts
+
+            appeal_changes = []
+            appeals = storage.get_appeals_by_record(r.record_id)
+            for a in appeals:
+                if a.status == "已通过" and a.correction:
+                    changes = []
+                    if a.original_quality != r.quality:
+                        changes.append(f"质量等级: {a.original_quality}→{r.quality}")
+                    if a.original_duration_hours != r.duration_hours:
+                        changes.append(f"服务时长: {a.original_duration_hours}h→{r.duration_hours}h")
+                    if a.original_final_points != r.final_points:
+                        changes.append(f"最终积分: {a.original_final_points}→{r.final_points}")
+                    if a.original_deduction_points != r.deduction_points:
+                        changes.append(f"扣减积分: {a.original_deduction_points}→{r.deduction_points}")
+                    if a.correction.note:
+                        changes.append(f"备注: {a.correction.note}")
+                    appeal_changes.append({
+                        "appeal_id": a.appeal_id,
+                        "status": a.status,
+                        "handler": a.handler,
+                        "handled_at": a.handled_at.isoformat() if a.handled_at else None,
+                        "handle_note": a.handle_note,
+                        "changes": changes,
+                    })
+                elif a.status == "已驳回":
+                    appeal_changes.append({
+                        "appeal_id": a.appeal_id,
+                        "status": a.status,
+                        "handler": a.handler,
+                        "handled_at": a.handled_at.isoformat() if a.handled_at else None,
+                        "handle_note": a.handle_note,
+                        "rejection_reason": a.rejection_reason,
+                        "changes": [],
+                    })
+
+            review_result = "通过"
+            if r.review_note:
+                review_result = f"通过（{r.review_note}）"
+
+            detail_lines.append({
+                "record_id": r.record_id,
+                "service_date": r.service_date.isoformat(),
+                "project_id": r.project_id,
+                "project_name": project_map.get(r.project_id, "未知项目"),
+                "duration_hours": r.duration_hours,
+                "quality": r.quality,
+                "base_points": round(base_pts, 2),
+                "deduction_points": round(ded_pts, 2),
+                "final_points": round(fin_pts, 2),
+                "review_result": review_result,
+                "reviewed_by": r.reviewed_by,
+                "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
+                "appeal_changes": appeal_changes,
+            })
+
+        settlement = settlement_map.get(pid)
+        settlement_snapshot = None
+        if settlement:
+            settlement_snapshot = {
+                "settlement_id": settlement.settlement_id,
+                "total_records": settlement.total_records,
+                "total_hours": round(settlement.total_hours, 2),
+                "base_points": round(settlement.base_points, 2),
+                "deduction_points": round(settlement.deduction_points, 2),
+                "final_points": round(settlement.final_points, 2),
+                "settled_at": settlement.settled_at.isoformat() if settlement.settled_at else None,
+                "settled_by": settlement.settled_by,
+            }
+
+        consistency_check = None
+        if settlement:
+            records_match = settlement.total_records == len(recs)
+            hours_match = abs(settlement.total_hours - round(total_hours, 2)) < 0.01
+            base_match = abs(settlement.base_points - round(total_base_points, 2)) < 0.01
+            ded_match = abs(settlement.deduction_points - round(total_deduction_points, 2)) < 0.01
+            final_match = abs(settlement.final_points - round(total_final_points, 2)) < 0.01
+            consistency_check = {
+                "is_consistent": records_match and hours_match and base_match and ded_match and final_match,
+                "records_match": records_match,
+                "hours_match": hours_match,
+                "base_points_match": base_match,
+                "deduction_points_match": ded_match,
+                "final_points_match": final_match,
+            }
+
+        statements.append({
+            "month": month,
+            "participant_id": pid,
+            "participant_name": participant_name_val,
+            "summary": {
+                "total_records": len(recs),
+                "total_hours": round(total_hours, 2),
+                "base_points": round(total_base_points, 2),
+                "deduction_points": round(total_deduction_points, 2),
+                "final_points": round(total_final_points, 2),
+            },
+            "settlement_snapshot": settlement_snapshot,
+            "consistency_check": consistency_check,
+            "details": detail_lines,
+        })
+
+    statements.sort(key=lambda x: x["summary"]["final_points"], reverse=True)
+
+    return {
+        "month": month,
+        "total_participants": len(statements),
+        "statements": statements,
+    }
