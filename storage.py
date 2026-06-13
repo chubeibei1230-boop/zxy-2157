@@ -40,7 +40,7 @@ def _init_csv_files():
                        "final_points", "month", "warnings"],
         SETTLEMENTS_FILE: ["settlement_id", "month", "participant_id", "participant_name",
                            "total_records", "total_hours", "base_points", "deduction_points",
-                           "final_points", "settled_at", "settled_by"],
+                           "final_points", "is_official", "settled_at", "settled_by"],
         APPEALS_FILE: ["appeal_id", "record_id", "participant_id", "participant_name",
                        "project_id", "service_date", "month", "appeal_reason",
                        "supplementary_note", "expected_result", "status",
@@ -323,6 +323,7 @@ def list_settlements() -> List[MonthlySettlement]:
             base_points=float(r["base_points"]),
             deduction_points=float(r["deduction_points"]),
             final_points=float(r["final_points"]),
+            is_official=_parse_bool(r.get("is_official", "false")),
             settled_at=_parse_datetime(r["settled_at"]),
             settled_by=r["settled_by"]
         ) for r in rows
@@ -339,7 +340,7 @@ def save_settlement(settlement: MonthlySettlement):
         settlements.append(settlement)
     headers = ["settlement_id", "month", "participant_id", "participant_name",
                "total_records", "total_hours", "base_points", "deduction_points",
-               "final_points", "settled_at", "settled_by"]
+               "final_points", "is_official", "settled_at", "settled_by"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
 
@@ -348,7 +349,7 @@ def delete_settlements_by_month(month: str):
     settlements = [s for s in list_settlements() if s.month != month]
     headers = ["settlement_id", "month", "participant_id", "participant_name",
                "total_records", "total_hours", "base_points", "deduction_points",
-               "final_points", "settled_at", "settled_by"]
+               "final_points", "is_official", "settled_at", "settled_by"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
 
@@ -357,7 +358,7 @@ def delete_settlement(settlement_id: str):
     settlements = [s for s in list_settlements() if s.settlement_id != settlement_id]
     headers = ["settlement_id", "month", "participant_id", "participant_name",
                "total_records", "total_hours", "base_points", "deduction_points",
-               "final_points", "settled_at", "settled_by"]
+               "final_points", "is_official", "settled_at", "settled_by"]
     rows = [s.dict() for s in settlements]
     _write_csv(SETTLEMENTS_FILE, headers, rows)
 

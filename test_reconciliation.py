@@ -63,8 +63,8 @@ def test_reconciliation_basic():
     assert stmt["summary"]["total_records"] == 2
     assert len(stmt["details"]) == 2
     assert stmt["consistency_check"]["is_consistent"] == True
-    assert stmt["settlement_snapshot"] is not None
-    assert stmt["settlement_snapshot"]["total_records"] == 2
+    assert stmt["official_settlement_snapshot"] is not None
+    assert stmt["official_settlement_snapshot"]["total_records"] == 2
 
     for d in stmt["details"]:
         assert "record_id" in d
@@ -252,12 +252,12 @@ def test_reconciliation_no_settlement():
     stmt = result["statements"][0]
 
     print(f"汇总记录数: {stmt['summary']['total_records']}")
-    print(f"核算快照: {stmt['settlement_snapshot']}")
+    print(f"核算快照: {stmt['official_settlement_snapshot']}")
     print(f"一致性检查: {stmt['consistency_check']}")
 
     assert stmt["summary"]["total_records"] == 1
     assert stmt["summary"]["final_points"] == 30.0
-    if stmt["settlement_snapshot"]:
+    if stmt["official_settlement_snapshot"]:
         assert stmt["consistency_check"]["is_consistent"] == True
         print("    ✓ 自动核算一致性验证通过")
     else:

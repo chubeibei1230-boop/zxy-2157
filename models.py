@@ -127,5 +127,6 @@ class MonthlySettlement(BaseModel):
     base_points: float = 0.0
     deduction_points: float = 0.0
     final_points: float = 0.0
+    is_official: bool = False
     settled_at: datetime = Field(default_factory=datetime.now)
     settled_by: str

@@ -598,7 +598,7 @@ def export_reconciliation_csv(
         "复核结果", "复核人", "复核时间",
         "申诉积分变化说明",
         "汇总-记录数", "汇总-总时长", "汇总-基础积分", "汇总-扣减积分", "汇总-最终积分",
-        "核算一致性"
+        "核算类型", "核算一致性"
     ])
     for stmt in result["statements"]:
         for i, detail in enumerate(stmt["details"]):
@@ -614,9 +614,17 @@ def export_reconciliation_csv(
                     )
             appeal_desc = " | ".join(appeal_desc_parts) if appeal_desc_parts else ""
 
+            settlement_type = ""
             consistency = ""
-            if i == 0 and stmt.get("consistency_check"):
-                consistency = "一致" if stmt["consistency_check"]["is_consistent"] else "不一致"
+            if i == 0:
+                if stmt.get("has_official_settlement"):
+                    settlement_type = "正式月度核算"
+                elif stmt.get("auto_settlement_snapshot"):
+                    settlement_type = "自动更新（非正式）"
+                else:
+                    settlement_type = "未核算"
+                if stmt.get("consistency_check"):
+                    consistency = "一致" if stmt["consistency_check"]["is_consistent"] else "不一致"
 
             writer.writerow([
                 stmt["month"] if i == 0 else "",
@@ -640,6 +648,7 @@ def export_reconciliation_csv(
                 stmt["summary"]["base_points"] if i == 0 else "",
                 stmt["summary"]["deduction_points"] if i == 0 else "",
                 stmt["summary"]["final_points"] if i == 0 else "",
+                settlement_type,
                 consistency,
             ])
     from fastapi.responses import PlainTextResponse
