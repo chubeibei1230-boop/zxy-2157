@@ -222,8 +222,11 @@ def test_bugfix_3_summary_from_official_settlement():
     print(f"  正式核算快照: 记录数={official_2['total_records']}, 最终积分={official_2['final_points']}")
     print(f"  汇总: 记录数={summary_2['total_records']}, 最终积分={summary_2['final_points']}")
 
-    assert summary_2["total_records"] == official_2["total_records"], "主汇总应与正式核算快照一致"
-    assert summary_2["final_points"] == official_2["final_points"], "主汇总应与正式核算快照一致"
+    assert official_2["total_records"] == official_after["total_records"], "正式核算快照不应被后续记录改写"
+    assert official_2["final_points"] == old_final, "正式核算快照不应被后续记录改写"
+    assert summary_2["total_records"] == official_2["total_records"], "主汇总应仍以正式核算快照为准"
+    assert summary_2["final_points"] == official_2["final_points"], "主汇总应仍以正式核算快照为准"
+    assert stmt_2["consistency_check"]["is_consistent"] == False, "后续记录变化应提示与正式核算不一致"
 
     print("    ✓ 主汇总优先采用正式月度核算结果验证通过")
 

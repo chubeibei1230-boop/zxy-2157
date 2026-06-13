@@ -903,7 +903,7 @@ def _update_settlement_after_correction(record: ServiceRecord,
     settlements = storage.list_settlements()
     target_settlement = None
     for s in settlements:
-        if s.month == record.month and s.participant_id == record.participant_id:
+        if s.month == record.month and s.participant_id == record.participant_id and not s.is_official:
             target_settlement = s
             break
 
