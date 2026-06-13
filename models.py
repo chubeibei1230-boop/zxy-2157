@@ -11,6 +11,7 @@ class AppealCorrection(BaseModel):
     quality: Optional[QualityLevel] = None
     duration_hours: Optional[float] = None
     deduction_rule_id: Optional[str] = None
+    clear_deduction_rule: bool = False
     deduction_points: Optional[float] = None
     final_points: Optional[float] = None
     note: Optional[str] = None
@@ -104,6 +105,7 @@ class ServiceRecord(BaseModel):
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
+    review_note: Optional[str] = None
     applicable_point_rule_id: Optional[str] = None
     applicable_point_version: Optional[str] = None
     applicable_deduction_id: Optional[str] = None

@@ -80,10 +80,29 @@ class RecordReviewRequest(BaseModel):
     approved: bool
     rejection_reason: Optional[str] = None
     deduction_rule_id: Optional[str] = None
+    review_note: Optional[str] = None
 
 
 class RecordVoidRequest(BaseModel):
     operator: str
+    void_reason: Optional[str] = None
+
+
+class ReviewApproveRequest(BaseModel):
+    reviewer: str
+    review_note: Optional[str] = None
+
+
+class ReviewRejectRequest(BaseModel):
+    reviewer: str
+    rejection_reason: str
+    review_note: Optional[str] = None
+
+
+class ReviewDeductRequest(BaseModel):
+    reviewer: str
+    deduction_rule_id: str
+    review_note: Optional[str] = None
 
 
 class RecordSubmitRequest(BaseModel):
@@ -265,7 +284,7 @@ def submit_record(record_id: str, req: RecordSubmitRequest):
 def review_record(record_id: str, req: RecordReviewRequest):
     record, error = services.review_record(
         record_id, req.reviewer, req.approved,
-        req.rejection_reason, req.deduction_rule_id
+        req.rejection_reason, req.deduction_rule_id, req.review_note
     )
     if error:
         raise HTTPException(status_code=400, detail=error)
@@ -274,7 +293,77 @@ def review_record(record_id: str, req: RecordReviewRequest):
 
 @app.post("/api/records/{record_id}/void", response_model=ServiceRecord, summary="作废服务记录")
 def void_record(record_id: str, req: RecordVoidRequest):
-    record = services.void_record(record_id, req.operator)
+    record = services.void_record(record_id, req.operator, req.void_reason)
+    if not record:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return record
+
+
+# ==================== Review Workstation APIs ====================
+
+@app.get("/api/review/pending", summary="查询待复核记录列表（复核工作台）")
+def query_pending_review(
+    month: Optional[str] = None,
+    project_id: Optional[str] = None,
+    participant_id: Optional[str] = None,
+    participant_name: Optional[str] = None,
+    anomaly_type: Optional[str] = Query(None, description="异常类型：duplicate(重复登记)、duration(时长异常)、missing_rule(规则缺失)、all(全部)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100)
+):
+    return services.query_pending_review(
+        month=month, project_id=project_id,
+        participant_id=participant_id, participant_name=participant_name,
+        anomaly_type=anomaly_type, page=page, page_size=page_size
+    )
+
+
+@app.get("/api/review/{record_id}", summary="获取复核详情（复核工作台）")
+def get_review_detail(record_id: str):
+    detail = services.get_review_detail(record_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return detail
+
+
+@app.post("/api/review/{record_id}/approve", response_model=ServiceRecord, summary="通过复核（复核工作台）")
+def approve_review(record_id: str, req: ReviewApproveRequest):
+    record, error = services.review_record(
+        record_id, req.reviewer, approved=True,
+        review_note=req.review_note
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return record
+
+
+@app.post("/api/review/{record_id}/reject", response_model=ServiceRecord, summary="退回复核（复核工作台）")
+def reject_review(record_id: str, req: ReviewRejectRequest):
+    record, error = services.review_record(
+        record_id, req.reviewer, approved=False,
+        rejection_reason=req.rejection_reason,
+        review_note=req.review_note
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return record
+
+
+@app.post("/api/review/{record_id}/deduct", response_model=ServiceRecord, summary="扣减后通过（复核工作台）")
+def deduct_and_approve_review(record_id: str, req: ReviewDeductRequest):
+    record, error = services.review_record(
+        record_id, req.reviewer, approved=True,
+        deduction_rule_id=req.deduction_rule_id,
+        review_note=req.review_note
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return record
+
+
+@app.post("/api/review/{record_id}/void", response_model=ServiceRecord, summary="作废记录（复核工作台）")
+def void_review(record_id: str, req: RecordVoidRequest):
+    record = services.void_record(record_id, req.operator, req.void_reason)
     if not record:
         raise HTTPException(status_code=404, detail="记录不存在")
     return record
@@ -356,7 +445,7 @@ def export_records_csv(
         "记录ID", "参与人姓名", "参与人ID", "项目ID", "服务日期",
         "开始时间", "结束时间", "时长(小时)", "质量", "备注",
         "状态", "登记人", "登记时间", "复核人", "复核时间",
-        "退回原因", "积分规则版本", "扣减规则版本",
+        "退回原因", "复核备注", "积分规则版本", "扣减规则版本",
         "基础积分", "扣减积分", "最终积分", "月份", "警告信息"
     ])
     for r in records:
@@ -365,7 +454,8 @@ def export_records_csv(
             r.service_date, r.start_time, r.end_time, r.duration_hours,
             r.quality, r.remarks or "", r.status, r.registered_by,
             r.registered_at, r.reviewed_by or "", r.reviewed_at or "",
-            r.rejection_reason or "", r.applicable_point_version or "",
+            r.rejection_reason or "", r.review_note or "",
+            r.applicable_point_version or "",
             r.applicable_deduction_version or "",
             r.calculated_points or 0, r.deduction_points or 0,
             r.final_points or 0, r.month or "",

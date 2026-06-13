@@ -248,12 +248,19 @@ def submit_record(record_id: str, operator: str) -> Tuple[Optional[ServiceRecord
 
 def review_record(record_id: str, reviewer: str, approved: bool,
                   rejection_reason: Optional[str] = None,
-                  deduction_rule_id: Optional[str] = None) -> Tuple[Optional[ServiceRecord], Optional[str]]:
+                  deduction_rule_id: Optional[str] = None,
+                  review_note: Optional[str] = None) -> Tuple[Optional[ServiceRecord], Optional[str]]:
     record = storage.get_record(record_id)
     if not record:
         return None, "记录不存在"
     if record.status != "待复核":
         return None, f"当前状态为「{record.status}」，只有「待复核」的记录可以复核"
+
+    old_calc_points = record.calculated_points or 0.0
+    old_ded_points = record.deduction_points or 0.0
+    old_final_points = record.final_points if record.final_points is not None else old_calc_points - old_ded_points
+    old_duration = record.duration_hours
+    old_status = record.status
 
     record.reviewed_by = reviewer
     record.reviewed_at = datetime.now()
@@ -286,19 +293,42 @@ def review_record(record_id: str, reviewer: str, approved: bool,
         record.status = "已退回"
         record.rejection_reason = rejection_reason or "未说明原因"
 
+    record.review_note = review_note
+
     storage.save_record(record)
+
+    _update_settlement_after_correction(
+        record, old_calc_points, old_ded_points,
+        old_final_points, old_duration, old_status, reviewer
+    )
+
     return record, None
 
 
-def void_record(record_id: str, operator: str) -> Optional[ServiceRecord]:
+def void_record(record_id: str, operator: str, void_reason: Optional[str] = None) -> Optional[ServiceRecord]:
     record = storage.get_record(record_id)
     if not record:
         return None
+
+    old_calc_points = record.calculated_points or 0.0
+    old_ded_points = record.deduction_points or 0.0
+    old_final_points = record.final_points if record.final_points is not None else old_calc_points - old_ded_points
+    old_duration = record.duration_hours
+    old_status = record.status
+
     record.status = "作废"
     record.reviewed_by = operator
     record.reviewed_at = datetime.now()
-    record.rejection_reason = record.rejection_reason or "作废处理"
+    record.rejection_reason = void_reason or record.rejection_reason or "作废处理"
+    record.review_note = void_reason
+
     storage.save_record(record)
+
+    _update_settlement_after_correction(
+        record, old_calc_points, old_ded_points,
+        old_final_points, old_duration, old_status, operator
+    )
+
     return record
 
 
@@ -371,6 +401,192 @@ def query_records(participant_id: Optional[str] = None,
         records = [r for r in records if r.registered_by == registered_by]
     records.sort(key=lambda r: r.registered_at, reverse=True)
     return records
+
+
+# ==================== Review Workstation ====================
+
+AnomalyType = Literal["duplicate", "duration", "missing_rule", "all"]
+
+
+def query_pending_review(
+    month: Optional[str] = None,
+    project_id: Optional[str] = None,
+    participant_id: Optional[str] = None,
+    participant_name: Optional[str] = None,
+    anomaly_type: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20
+) -> Dict:
+    """查询待复核记录，支持多维度筛选和异常类型过滤"""
+    records = query_records(status="待复核", month=month, project_id=project_id,
+                            participant_id=participant_id, participant_name=participant_name)
+
+    if anomaly_type and anomaly_type != "all":
+        keyword_map = {
+            "duplicate": "疑似重复登记",
+            "duration": "时长异常",
+            "missing_rule": "规则缺失"
+        }
+        keyword = keyword_map.get(anomaly_type, "")
+        if keyword:
+            records = [r for r in records if any(keyword in w for w in (r.warnings or []))]
+
+    total = len(records)
+    total_pages = (total + page_size - 1) // page_size
+    start = (page - 1) * page_size
+    end = start + page_size
+    paged_records = records[start:end]
+
+    project_map = {p.project_id: p.project_name for p in storage.list_projects()}
+
+    record_list = []
+    for r in paged_records:
+        record_list.append({
+            "record_id": r.record_id,
+            "participant_id": r.participant_id,
+            "participant_name": r.participant_name,
+            "project_id": r.project_id,
+            "project_name": project_map.get(r.project_id, "未知项目"),
+            "service_date": r.service_date,
+            "start_time": r.start_time,
+            "end_time": r.end_time,
+            "duration_hours": r.duration_hours,
+            "quality": r.quality,
+            "status": r.status,
+            "calculated_points": r.calculated_points,
+            "deduction_points": r.deduction_points,
+            "final_points": r.final_points,
+            "month": r.month,
+            "warnings": r.warnings or [],
+            "registered_by": r.registered_by,
+            "registered_at": r.registered_at,
+            "has_duplicate": any("疑似重复登记" in w for w in (r.warnings or [])),
+            "has_duration_anomaly": any("时长异常" in w for w in (r.warnings or [])),
+            "has_missing_rule": any("规则缺失" in w for w in (r.warnings or [])),
+        })
+
+    anomaly_stats = {
+        "total_pending": len(query_records(status="待复核")),
+        "duplicate_count": len([r for r in query_records(status="待复核")
+                                if any("疑似重复登记" in w for w in (r.warnings or []))]),
+        "duration_anomaly_count": len([r for r in query_records(status="待复核")
+                                       if any("时长异常" in w for w in (r.warnings or []))]),
+        "missing_rule_count": len([r for r in query_records(status="待复核")
+                                   if any("规则缺失" in w for w in (r.warnings or []))]),
+    }
+
+    return {
+        "total": total,
+        "total_pages": total_pages,
+        "page": page,
+        "page_size": page_size,
+        "records": record_list,
+        "anomaly_stats": anomaly_stats
+    }
+
+
+def get_review_detail(record_id: str) -> Optional[Dict]:
+    """获取复核详情：基础信息、适用积分规则、扣减规则候选项、历史申诉"""
+    record = storage.get_record(record_id)
+    if not record:
+        return None
+
+    project = storage.get_project(record.project_id)
+    project_name = project.project_name if project else "未知项目"
+
+    point_rule = None
+    if record.applicable_point_rule_id:
+        point_rule = storage.get_point_rule(record.applicable_point_rule_id)
+    else:
+        point_rule = storage.get_applicable_point_rule(record.project_id, record.service_date)
+
+    deduction_rules = list_deduction_rules_by_date(record.service_date)
+    deduction_candidates = []
+    for dr in deduction_rules:
+        deduction_candidates.append({
+            "deduction_id": dr.deduction_id,
+            "rule_version": dr.rule_version,
+            "reason": dr.reason,
+            "deduction_points": dr.deduction_points,
+            "description": dr.description,
+            "is_applicable": dr.effective_date <= record.service_date
+        })
+
+    appeals = storage.get_appeals_by_record(record_id)
+    appeal_list = []
+    for a in appeals:
+        appeal_list.append({
+            "appeal_id": a.appeal_id,
+            "status": a.status,
+            "appeal_reason": a.appeal_reason,
+            "supplementary_note": a.supplementary_note,
+            "expected_result": a.expected_result,
+            "submitted_by": a.submitted_by,
+            "submitted_at": a.submitted_at,
+            "handler": a.handler,
+            "handled_at": a.handled_at,
+            "handle_note": a.handle_note,
+            "rejection_reason": a.rejection_reason,
+        })
+
+    duplicate_records = detect_duplicate_records(record)
+    duplicate_list = []
+    for dr in duplicate_records:
+        dup_project = storage.get_project(dr.project_id)
+        duplicate_list.append({
+            "record_id": dr.record_id,
+            "project_name": dup_project.project_name if dup_project else "未知项目",
+            "service_date": dr.service_date,
+            "start_time": dr.start_time,
+            "end_time": dr.end_time,
+            "duration_hours": dr.duration_hours,
+            "status": dr.status,
+            "participant_name": dr.participant_name,
+        })
+
+    has_duration_issue, duration_msg = detect_duration_anomaly(record)
+
+    return {
+        "record": {
+            "record_id": record.record_id,
+            "participant_id": record.participant_id,
+            "participant_name": record.participant_name,
+            "project_id": record.project_id,
+            "project_name": project_name,
+            "service_date": record.service_date,
+            "start_time": record.start_time,
+            "end_time": record.end_time,
+            "duration_hours": record.duration_hours,
+            "quality": record.quality,
+            "remarks": record.remarks,
+            "status": record.status,
+            "registered_by": record.registered_by,
+            "registered_at": record.registered_at,
+            "reviewed_by": record.reviewed_by,
+            "reviewed_at": record.reviewed_at,
+            "rejection_reason": record.rejection_reason,
+            "review_note": record.review_note,
+            "calculated_points": record.calculated_points,
+            "deduction_points": record.deduction_points,
+            "final_points": record.final_points,
+            "month": record.month,
+            "warnings": record.warnings or [],
+        },
+        "applicable_point_rule": point_rule.dict() if point_rule else None,
+        "deduction_candidates": deduction_candidates,
+        "current_deduction": {
+            "deduction_id": record.applicable_deduction_id,
+            "deduction_version": record.applicable_deduction_version,
+            "deduction_points": record.deduction_points,
+        } if record.applicable_deduction_id else None,
+        "appeal_history": appeal_list,
+        "duplicate_records": duplicate_list,
+        "duration_anomaly": {
+            "has_issue": has_duration_issue,
+            "message": duration_msg
+        },
+        "missing_rule": point_rule is None,
+    }
 
 
 # ==================== Statistics ====================
@@ -460,6 +676,7 @@ def run_monthly_settlement(month: str, operator: str) -> Dict:
         total_hours = sum(r.duration_hours for r in recs)
         base_points = 0.0
         deduction_points = 0.0
+        final_points = 0.0
         for r in recs:
             if r.applicable_point_rule_id:
                 point_rule = storage.get_point_rule(r.applicable_point_rule_id)
@@ -477,8 +694,8 @@ def run_monthly_settlement(month: str, operator: str) -> Dict:
             else:
                 base_points += r.calculated_points or 0.0
             deduction_points += r.deduction_points or 0.0
+            final_points += r.final_points if r.final_points is not None else ((r.calculated_points or 0.0) - (r.deduction_points or 0.0))
 
-        final_points = base_points - deduction_points
         participant_name = recs[0].participant_name
 
         settlement = MonthlySettlement(
@@ -594,9 +811,24 @@ def get_appeal_detail(appeal_id: str) -> Optional[Dict]:
     if not appeal:
         return None
     record = storage.get_record(appeal.record_id)
+    original_record_snapshot = {
+        "record_id": appeal.record_id,
+        "participant_id": appeal.participant_id,
+        "participant_name": appeal.participant_name,
+        "project_id": appeal.project_id,
+        "service_date": appeal.service_date,
+        "month": appeal.month,
+        "quality": appeal.original_quality,
+        "duration_hours": appeal.original_duration_hours,
+        "status": appeal.original_status,
+        "calculated_points": appeal.original_calculated_points,
+        "deduction_points": appeal.original_deduction_points,
+        "final_points": appeal.original_final_points,
+    }
     return {
         "appeal": appeal,
-        "original_record": record
+        "original_record": original_record_snapshot,
+        "current_record": record
     }
 
 
@@ -625,13 +857,14 @@ def _recalculate_record_points(record: ServiceRecord) -> ServiceRecord:
 
 def _update_settlement_after_correction(record: ServiceRecord,
                                         old_calc_points: float, old_ded_points: float,
-                                        old_duration: float, old_status: str,
+                                        old_final_points: float, old_duration: float, old_status: str,
                                         operator: str):
     if not record.month:
         return
 
     new_calc_points = record.calculated_points or 0.0
     new_ded_points = record.deduction_points or 0.0
+    new_final_points = record.final_points if record.final_points is not None else new_calc_points - new_ded_points
     new_duration = record.duration_hours
     new_status = record.status
 
@@ -648,7 +881,15 @@ def _update_settlement_after_correction(record: ServiceRecord,
             target_settlement = s
             break
 
-    if not target_settlement:
+    if not target_settlement and is_counted:
+        target_settlement = MonthlySettlement(
+            settlement_id=generate_id("setl"),
+            month=record.month,
+            participant_id=record.participant_id,
+            participant_name=record.participant_name,
+            settled_by=operator
+        )
+    elif not target_settlement:
         return
 
     if was_counted and is_counted:
@@ -658,19 +899,19 @@ def _update_settlement_after_correction(record: ServiceRecord,
         target_settlement.base_points = round(target_settlement.base_points + calc_diff, 2)
         target_settlement.deduction_points = round(target_settlement.deduction_points + ded_diff, 2)
         target_settlement.total_hours = round(target_settlement.total_hours + duration_diff, 2)
-        target_settlement.final_points = round(target_settlement.base_points - target_settlement.deduction_points, 2)
+        target_settlement.final_points = round(target_settlement.final_points + (new_final_points - old_final_points), 2)
     elif was_counted and not is_counted:
         target_settlement.total_records -= 1
         target_settlement.base_points = round(target_settlement.base_points - old_calc_points, 2)
         target_settlement.deduction_points = round(target_settlement.deduction_points - old_ded_points, 2)
         target_settlement.total_hours = round(target_settlement.total_hours - old_duration, 2)
-        target_settlement.final_points = round(target_settlement.base_points - target_settlement.deduction_points, 2)
+        target_settlement.final_points = round(target_settlement.final_points - old_final_points, 2)
     elif not was_counted and is_counted:
         target_settlement.total_records += 1
         target_settlement.base_points = round(target_settlement.base_points + new_calc_points, 2)
         target_settlement.deduction_points = round(target_settlement.deduction_points + new_ded_points, 2)
         target_settlement.total_hours = round(target_settlement.total_hours + new_duration, 2)
-        target_settlement.final_points = round(target_settlement.base_points - target_settlement.deduction_points, 2)
+        target_settlement.final_points = round(target_settlement.final_points + new_final_points, 2)
 
     target_settlement.settled_at = datetime.now()
     target_settlement.settled_by = operator
@@ -692,8 +933,17 @@ def approve_appeal(appeal_id: str, handler: str,
 
     old_calc_points = record.calculated_points or 0.0
     old_ded_points = record.deduction_points or 0.0
+    old_final_points = record.final_points if record.final_points is not None else old_calc_points - old_ded_points
     old_duration = record.duration_hours
     old_status = record.status
+    old_values = {
+        "quality": record.quality,
+        "duration_hours": record.duration_hours,
+        "deduction_rule_id": record.applicable_deduction_id,
+        "deduction_points": record.deduction_points,
+        "final_points": record.final_points,
+        "status": record.status,
+    }
 
     if correction.quality is not None:
         record.quality = correction.quality
@@ -708,6 +958,10 @@ def approve_appeal(appeal_id: str, handler: str,
         record.applicable_deduction_id = ded_rule.deduction_id
         record.applicable_deduction_version = ded_rule.rule_version
         record.deduction_points = ded_rule.deduction_points
+    if correction.clear_deduction_rule:
+        record.applicable_deduction_id = None
+        record.applicable_deduction_version = None
+        record.deduction_points = 0.0
     if correction.deduction_points is not None:
         record.deduction_points = correction.deduction_points
 
@@ -724,8 +978,18 @@ def approve_appeal(appeal_id: str, handler: str,
 
     _update_settlement_after_correction(
         record, old_calc_points, old_ded_points,
-        old_duration, old_status, handler
+        old_final_points, old_duration, old_status, handler
     )
+
+    new_values = {
+        "quality": record.quality,
+        "duration_hours": record.duration_hours,
+        "deduction_rule_id": record.applicable_deduction_id,
+        "deduction_points": record.deduction_points,
+        "final_points": record.final_points,
+        "status": record.status,
+    }
+    changed_fields = [f"{key}: {old_values[key]} -> {new_values[key]}" for key in old_values if old_values[key] != new_values[key]]
 
     appeal.status = "已通过"
     appeal.handler = handler
@@ -736,7 +1000,7 @@ def approve_appeal(appeal_id: str, handler: str,
         TimelineEvent(
             event_type="申诉通过",
             operator=handler,
-            description=f"申诉通过，处理说明：{handle_note or '无'}"
+            description=f"申诉通过，处理说明：{handle_note or '无'}；更正内容：{'; '.join(changed_fields) if changed_fields else '无字段变更'}"
         )
     )
     storage.save_appeal(appeal)
